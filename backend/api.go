@@ -952,7 +952,7 @@ func (a *Api) CommitUploadOverride(
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -1067,7 +1067,7 @@ func (a *Api) GetDownloadURLs(mediaKey string) (*DownloadURLs, error) {
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -1173,7 +1173,7 @@ func (a *Api) GetMediaInfo(mediaKey string) (*MediaItem, error) {
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -2043,7 +2043,7 @@ func (a *Api) GetThumbnail(mediaKey string, width, height int, forceJPEG bool, c
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -2100,33 +2100,43 @@ func (a *Api) DownloadFile(downloadURL, outputPath string) error {
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Create output file
-	outFile, err := os.Create(outputPath)
+	// Write to temp file then rename, so a mid-download failure leaves no partial file at outputPath
+	tmpPath := outputPath + ".part"
+	outFile, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
-	defer outFile.Close()
+	cleanupTmp := func() { _ = os.Remove(tmpPath) }
 
 	// Handle gzip response if needed
 	var reader io.Reader = resp.Body
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		reader, err = gzip.NewReader(resp.Body)
 		if err != nil {
+			_ = outFile.Close()
+			cleanupTmp()
 			return fmt.Errorf("failed to create gzip reader: %w", err)
 		}
 		defer reader.(*gzip.Reader).Close()
 	}
 
-	// Copy response body to file
-	_, err = io.Copy(outFile, reader)
-	if err != nil {
+	if _, err = io.Copy(outFile, reader); err != nil {
+		_ = outFile.Close()
+		cleanupTmp()
 		return fmt.Errorf("failed to write file: %w", err)
 	}
-
+	if err = outFile.Close(); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("failed to close output file: %w", err)
+	}
+	if err = os.Rename(tmpPath, outputPath); err != nil {
+		cleanupTmp()
+		return fmt.Errorf("failed to finalize output file: %w", err)
+	}
 	return nil
 }
 
@@ -2219,7 +2229,7 @@ func (a *Api) GetMediaList(pageToken string, syncToken string, triggerMode int, 
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -3071,7 +3081,7 @@ func (a *Api) GetAlbumList(pageToken string) (*AlbumListResult, error) {
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
