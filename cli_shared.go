@@ -1,7 +1,6 @@
 package main
 
 import (
-	"app/backend"
 	"embed"
 	"fmt"
 	"os"
@@ -9,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"app/backend"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -94,9 +95,16 @@ func runCLI() {
 				config.deleteFromHost = true
 			case "--disable-filter", "-df":
 				config.disableUnsupportedFilesFilter = true
+			case "--date-from-filename":
+				config.setDateFromFilename = true
+			case "--exclude", "-e":
+				if i+1 < len(os.Args) {
+					config.excludePattern = os.Args[i+1]
+					i++
+				}
 			case "--threads", "-t":
 				if i+1 < len(os.Args) {
-					fmt.Sscanf(os.Args[i+1], "%d", &config.threads)
+					_, _ = fmt.Sscanf(os.Args[i+1], "%d", &config.threads)
 					i++
 				}
 			case "--log-level", "-l":
@@ -107,6 +115,11 @@ func runCLI() {
 			case "--config", "-c":
 				if i+1 < len(os.Args) {
 					config.configPath = os.Args[i+1]
+					i++
+				}
+			case "--album", "-a":
+				if i+1 < len(os.Args) {
+					config.albumName = os.Args[i+1]
 					i++
 				}
 			}
@@ -514,8 +527,10 @@ func printCLIHelp() {
 	fmt.Println(titleStyle.Render("gotohp - Unofficial Google Photos CLI & GUI"))
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Printf("  %s              Launch GUI application\n", commandStyle.Render("gotohp"))
-	fmt.Printf("  %s %s    Run CLI command\n", commandStyle.Render("gotohp"), argStyle.Render("<command>"))
+	if cliHasGUI {
+		fmt.Printf("  %s              Launch GUI application\n", commandStyle.Render(cliExecutableName))
+	}
+	fmt.Printf("  %s %s    Run CLI command\n", commandStyle.Render(cliExecutableName), argStyle.Render("<command>"))
 	fmt.Println()
 	fmt.Println("Core Commands:")
 	fmt.Printf("  %s          Upload files or directories to Google Photos\n", commandStyle.Render("upload"))
@@ -533,7 +548,7 @@ func printCLIHelp() {
 	fmt.Printf("  %s         Show version information\n", commandStyle.Render("version, -v"))
 	fmt.Println()
 	fmt.Println("Options:")
-	fmt.Println("  Use 'gotohp <command> --help' for detailed information on any command.")
+	fmt.Printf("  Use '%s <command> --help' for detailed information on any command.\n", cliExecutableName)
 }
 
 func printFlag(short, long, arg, description string) {
@@ -558,7 +573,7 @@ func printFlag(short, long, arg, description string) {
 }
 
 func printUploadHelp() {
-	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("upload"), argStyle.Render("<filepath>"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("upload"), argStyle.Render("<filepath>"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("Upload files or directories to Google Photos.")
 	fmt.Println()
@@ -568,12 +583,15 @@ func printUploadHelp() {
 	printFlag("-f", "--force", "", "Force upload even if file exists")
 	printFlag("-d", "--delete", "", "Delete from host after upload")
 	printFlag("-df", "--disable-filter", "", "Disable file type filtering")
+	printFlag("", "--date-from-filename", "", "Set media date from filename (e.g. 20240709_182027.jpg)")
+	printFlag("-e", "--exclude", "<pattern>", "Skip directories with this exact name during recursive upload")
+	printFlag("-a", "--album", "<name>", "Add uploaded files to album (use AUTO for folder-based albums)")
 	printFlag("-l", "--log-level", "<level>", "Set log level: debug, info, warn, error (default: info)")
 	printFlag("-c", "--config", "<path>", "Path to config file")
 }
 
 func printAutoWashHelp() {
-	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("autowash"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("autowash"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("Start auto-wash service to automatically sync library and backup media.")
 	fmt.Println()
@@ -586,7 +604,7 @@ func printAutoWashHelp() {
 }
 
 func printDownloadHelp() {
-	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("download"), argStyle.Render("<media-key>"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("download"), argStyle.Render("<media-key>"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("Download a file from Google Photos using its media key.")
 	fmt.Println()
@@ -597,7 +615,7 @@ func printDownloadHelp() {
 }
 
 func printThumbnailHelp() {
-	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("thumbnail"), argStyle.Render("<media-key>"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("thumbnail"), argStyle.Render("<media-key>"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("Download a thumbnail of a media item at various sizes.")
 	fmt.Println()
@@ -621,7 +639,7 @@ func printThumbnailHelp() {
 }
 
 func printListHelp() {
-	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("list"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("list"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("List media items in your Google Photos library.")
 	fmt.Println()
@@ -636,7 +654,7 @@ func printListHelp() {
 }
 
 func printAlbumsHelp() {
-	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("albums"), flagStyle.Render("[flags]"))
+	fmt.Printf("Usage: %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("albums"), flagStyle.Render("[flags]"))
 	fmt.Println()
 	fmt.Println("List albums in your Google Photos library.")
 	fmt.Println()
@@ -648,7 +666,7 @@ func printAlbumsHelp() {
 }
 
 func printCredentialsHelp() {
-	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render("gotohp"), commandStyle.Render("creds"), argStyle.Render("<subcommand>"), flagStyle.Render("[args]"))
+	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("creds"), argStyle.Render("<subcommand>"), flagStyle.Render("[args]"))
 	fmt.Println()
 	fmt.Println("Manage Google Photos credentials and accounts.")
 	fmt.Println()
@@ -696,7 +714,7 @@ func handleCredentialsCommand(args []string) {
 	case "add":
 		if len(args) < 2 {
 			fmt.Println("Error: auth-string required")
-			fmt.Println("Usage: gotohp credentials add <auth-string>")
+			fmt.Printf("Usage: %s credentials add <auth-string>\n", cliExecutableName)
 			os.Exit(1)
 		}
 		authString := args[1]
@@ -710,7 +728,7 @@ func handleCredentialsCommand(args []string) {
 	case "remove", "rm":
 		if len(args) < 2 {
 			fmt.Println("Error: email required")
-			fmt.Println("Usage: gotohp credentials remove <email>")
+			fmt.Printf("Usage: %s credentials remove <email>\n", cliExecutableName)
 			os.Exit(1)
 		}
 		email := args[1]
@@ -749,7 +767,7 @@ func handleCredentialsCommand(args []string) {
 	case "set", "select":
 		if len(args) < 2 {
 			fmt.Println("Error: email required")
-			fmt.Println("Usage: gotohp creds set <email>")
+			fmt.Printf("Usage: %s creds set <email>\n", cliExecutableName)
 			os.Exit(1)
 		}
 		query := args[1]

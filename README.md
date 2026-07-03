@@ -24,29 +24,30 @@ Unofficial Google Photos Desktop GUI Client
 - Adjustable thumbnail sizes (small, medium, large)
 - One-click photo download
 - Pagination support
-- Optional periodic update checks (incremental sync) with quota-item “wash” (download + re-upload)
+- Optional periodic update checks (incremental sync) with quota-item "wash" (download + re-upload)
 
 ### General Features
 - Credential management for multiple accounts
 - CLI mode for advanced users
-- Configurable, presistent settings (stored in "%system config path%/gotohp/gotohp.config")  
+- Configurable, presistent settings (stored in "%system config path%/gotohp/gotohp.config")
     You can force local config by creating empty gotohp.config next to executable.
 
 ## [Download](https://github.com/xob0t/gotohp/releases/latest)
 
 ## CLI Usage
 
-### Windows
+Releases include a standalone CLI executable for command-line usage. Use the `gotohp-cli` artifact for your platform; it does not depend on the GUI runtime.
 
-Windows releases include a dedicated CLI executable (`gotohp-cli.exe`) for command-line usage:
+Releases include a dedicated CLI executable (`gotohp-cli` / `gotohp-cli.exe`):
 
-```cmd
-gotohp-cli.exe upload C:\path\to\photos --recursive --threads 5
-gotohp-cli.exe creds list
-gotohp-cli.exe creds add "androidId=..."
-gotohp-cli.exe creds set user@gmail.com
-gotohp-cli.exe thumbnail <media-key> --size large
-gotohp-cli.exe version
+```shell
+gotohp-cli upload /path/to/photos --recursive --threads 5
+gotohp-cli upload /path/to/photos --recursive --exclude @eaDir
+gotohp-cli creds list
+gotohp-cli creds add "androidId=..."
+gotohp-cli creds set user@gmail.com
+gotohp-cli thumbnail <media-key> --size large
+gotohp-cli version
 ```
 
 **Available commands:**
@@ -57,6 +58,9 @@ gotohp-cli.exe version
   - `-f, --force` - Force upload even if file exists
   - `-d, --delete` - Delete from host after upload
   - `-df, --disable-filter` - Disable file type filtering
+  - `--date-from-filename` - Set media date from filename (e.g. `20240709_182027.jpg`)
+  - `-e, --exclude <pattern>` - Skip directories with this exact name during recursive upload (e.g. `@eaDir`)
+  - `-a, --album <name>` - Add uploaded files to album (use `AUTO` for folder-based albums)
   - `-l, --log-level <level>` - Set log level: debug, info, warn, error (default: info)
   - `-c, --config <path>` - Path to config file
 - `thumbnail <media-key>` (alias: `thumb`) - Download a thumbnail at various sizes
@@ -84,19 +88,6 @@ gotohp-cli.exe version
 - `version` - Show version information
 - `help` - Show help message
 
-### macOS / Linux
-
-The main executable supports CLI mode:
-
-```bash
-./gotohp upload /path/to/photos --recursive --threads 5
-./gotohp creds list
-./gotohp thumbnail <media-key> --size large
-./gotohp list --pages 2
-./gotohp albums --pages 1
-./gotohp version
-```
-
 ## Requires mobile app credentials to work
 
 You only need to do this once.
@@ -104,22 +95,22 @@ You only need to do this once.
 ### Option 1 - ReVanced. No root required
 
 1. Install Google Photos ReVanced on your android device/emulator.
-    - Install GmsCore [https://github.com/ReVanced/GmsCore/releases](https://github.com/ReVanced/GmsCore/releases)
-    - Install patched apk [https://github.com/j-hc/revanced-magisk-module/releases](https://github.com/j-hc/revanced-magisk-module/releases) or patch it yourself
+   - Install GmsCore [https://github.com/ReVanced/GmsCore/releases](https://github.com/ReVanced/GmsCore/releases)
+   - Install patched apk [https://github.com/RookieEnough/Morphe-AutoBuilds/releases](https://github.com/RookieEnough/Morphe-AutoBuilds/releases) or patch it yourself
 2. Connect the device to your PC via ADB.
 3. Open the terminal on your PC and execute
 
-    Windows
+   Windows
 
-    ```cmd
-    adb logcat | FINDSTR "auth%2Fphotos.native"
-    ```
+   ```cmd
+   adb logcat | FINDSTR "auth%2Fphotos.native"
+   ```
 
-    Linux/Mac
+   Linux/Mac
 
-    ```shell
-    adb logcat | grep "auth%2Fphotos.native"
-    ```
+   ```shell
+   adb logcat | grep "auth%2Fphotos.native"
+   ```
 
 4. If you are already using ReVanced - remove Google Account from GmsCore.
 5. Open Google Photos ReVanced on your device and log into your account.
@@ -132,31 +123,36 @@ You only need to do this once.
 <details>
   <summary><strong>Click to expand</strong></summary>
 
-1. Get a rooted android device or an emulator. Recommended Android versions 9-13
+1. Get a rooted android device or an emulator.
 2. Connect the device to your PC via ADB.
 3. Install [HTTP Toolkit](https://httptoolkit.com)
 4. In HTTP Toolkit, select Intercept - `Android Device via ADB`. Filter traffic with
 
-    ```text
-    contains(https://www.googleapis.com/auth/photos.native)
-    ```
+   ```text
+   contains(https://www.googleapis.com/auth/photos.native)
+   ```
 
-    Or if you have an older version of Google Photos, try
+   Or if you have an older version of Google Photos, try
 
-    ```text
-    contains(www.googleapis.com%2Fauth%2Fplus.photos.readwrite)
-    ```
+   ```text
+   contains(www.googleapis.com%2Fauth%2Fplus.photos.readwrite)
+   ```
 
 5. Open Google Photos app and login with your account.
 6. A single request should appear.  
    Copy request body as text.
+7. Add that credential string in gotohp.
+8. If gotohp asks for a token binding key, keep the rooted device connected and click `Read from ADB`. gotohp will read the account's `lstBindingKeyAlias` from Android AccountManager and save it into the credential.
 
 #### Troubleshooting
 
-- **No Auth Request Intercepted**  
+- **No Auth Request Intercepted**
   1. Log out of your Google account.
   2. Log in again.
   3. Try `Android App via Frida` interception method in HTTP Toolkit.
+- **Token binding key not found**
+  1. Make sure the same Google account is present on the connected device.
+  2. Make sure root is available to ADB.
 
 </details>
 

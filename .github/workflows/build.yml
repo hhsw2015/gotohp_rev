@@ -79,45 +79,65 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install Task
-        run: |
-          go install github.com/go-task/task/v3/cmd/task@latest
+      - name: Install Wails3
+        run: go install -v github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.95
 
       - name: Build macOS App (Production)
         run: |
           mkdir -p release
+          wails3 doctor
 
-          # Build the universal CLI application
-          task darwin:build:cli:universal PRODUCTION=true
-          mv bin/gotohp-cli-universal "gotohp-macos-cli-universal"
-          zip -r release/gotohp-macos-cli-universal.zip gotohp-macos-cli-universal
+          # Update build assets
+          wails3 task common:update:build-assets
+
+          # Build the app package
+          wails3 task darwin:package:universal
+
+          # Build standalone CLI binary without Wails/WebView dependencies
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -tags cli -trimpath -buildvcs=false -ldflags="-w -s" -o bin/gotohp-cli-amd64
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags cli -trimpath -buildvcs=false -ldflags="-w -s" -o bin/gotohp-cli-arm64
+          lipo -create -output release/gotohp-cli-macos-universal bin/gotohp-cli-amd64 bin/gotohp-cli-arm64
+          rm bin/gotohp-cli-amd64 bin/gotohp-cli-arm64
+
+          # Create zip file of the .app bundle
+          cd bin
+          zip -r ../release/gotohp-macos-universal.zip gotohp.app
+          cd ..
 
       - name: Build macOS App (Debug)
         if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         run: |
           # Clean bin directory
-          rm -f bin/gotohp-cli-universal
+          rm -rf bin/gotohp.app
+          rm -f bin/gotohp
 
-          # Build debug version
-          task darwin:build:cli:universal
+          # Build debug version (creates binary, not .app)
+          wails3 build
 
           # Rename debug binary
-          mv bin/gotohp-cli-universal "release/gotohp-macos-cli-universal_debug"
+          mv bin/gotohp release/gotohp-macos-universal_debug
 
-      - name: Upload macOS Artifact
+      - name: Upload macOS Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-artifact
+          name: macos-release
           path: |
-            release/gotohp-macos-cli-universal.zip
-            release/gotohp-macos-cli-universal_debug
+            release/gotohp-macos-universal.zip
+            release/gotohp-cli-macos-universal
+
+      - name: Upload macOS Debug Artifact
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-debug
+          path: release/gotohp-macos-universal_debug
 
       - name: Upload to Draft Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/gotohp-macos-cli-universal.zip
-            release/gotohp-macos-cli-universal_debug
+            release/gotohp-macos-universal.zip
+            release/gotohp-cli-macos-universal
           tag_name: ${{ steps.set-tag.outputs.tag_name }}
           name: ${{ steps.set-tag.outputs.release_name }}
           body: ${{ steps.set-tag.outputs.release_body }}
@@ -176,7 +196,7 @@ jobs:
 
       - name: Install Wails3
         shell: cmd
-        run: go install -v github.com/wailsapp/wails/v3/cmd/wails3@latest
+        run: go install -v github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.95
 
       - name: Build Windows App (Production)
         shell: pwsh
@@ -191,9 +211,11 @@ jobs:
           task windows:build PRODUCTION=true
           Move-Item -Path "bin\gotohp.exe" -Destination "release\gotohp-x64.exe"
 
-          # Build the CLI-only application with production flags
-          task windows:build:cli PRODUCTION=true
-          Move-Item -Path "bin\gotohp-cli.exe" -Destination "release\gotohp-cli-x64.exe"
+          # Build standalone CLI binary without Wails/WebView dependencies
+          $env:CGO_ENABLED="0"
+          $env:GOOS="windows"
+          $env:GOARCH="amd64"
+          go build -tags cli -trimpath -buildvcs=false -ldflags="-w -s" -o "release\gotohp-cli-x64.exe"
 
       - name: Build Windows App (Debug)
         if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
@@ -207,17 +229,26 @@ jobs:
           wails3 build
           Move-Item -Path "bin\gotohp.exe" -Destination "release\gotohp-x64_debug.exe"
 
-          # Build CLI debug version
-          task windows:build:cli
-          Move-Item -Path "bin\gotohp-cli.exe" -Destination "release\gotohp-cli-x64_debug.exe"
+          # Build CLI debug version without Wails/WebView dependencies
+          $env:CGO_ENABLED="0"
+          $env:GOOS="windows"
+          $env:GOARCH="amd64"
+          go build -tags cli -buildvcs=false -gcflags=all="-l" -o "release\gotohp-cli-x64_debug.exe"
 
-      - name: Upload Windows Artifact
+      - name: Upload Windows Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-artifact
+          name: windows-release
           path: |
             release/gotohp-x64.exe
             release/gotohp-cli-x64.exe
+
+      - name: Upload Windows Debug Artifact
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-debug
+          path: |
             release/gotohp-x64_debug.exe
             release/gotohp-cli-x64_debug.exe
 
@@ -227,8 +258,6 @@ jobs:
           files: |
             release/gotohp-x64.exe
             release/gotohp-cli-x64.exe
-            release/gotohp-x64_debug.exe
-            release/gotohp-cli-x64_debug.exe
           tag_name: ${{ steps.set-tag.outputs.tag_name }}
           name: ${{ steps.set-tag.outputs.release_name }}
           body: ${{ steps.set-tag.outputs.release_body }}
@@ -282,46 +311,80 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config
+          sudo apt-get install -y build-essential gcc pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
 
-      - name: Install Task
-        run: |
-          go install github.com/go-task/task/v3/cmd/task@latest
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Install Wails3
+        run: go install -v github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.95
 
       - name: Build Linux App (Production)
         run: |
           mkdir -p release
-          
-          # Build the CLI application
-          task linux:build:cli PRODUCTION=true
-          mv bin/gotohp-cli "release/gotohp-cli_amd64"
+          wails3 doctor
+
+          # Update build assets
+          wails3 task common:update:build-assets
+
+          # Build the application
+          wails3 task package
+
+          # Generate deb package
+          wails3 tool package -name gotohp -format deb -config ./build/linux/nfpm/nfpm.yaml -out ./release
+
+          # Build CLI binary and package without Wails/WebView dependencies
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags cli -trimpath -buildvcs=false -ldflags="-w -s" -o "bin/gotohp-cli"
+          cp bin/gotohp-cli "release/gotohp-cli_amd64"
+          nfpm package --packager deb --config ./build/linux/nfpm/nfpm-cli.yaml --target ./release/gotohp-cli_amd64.deb
+
+          # Generate AppImage
+          wails3 package
+          mv bin/gotohp-x86_64.AppImage "release/gotohp_amd64.AppImage"
+          rm -f bin/gotohp-x86_64.AppImage
+
+          # Rename .deb file if needed
+          if [ -f "release/gotohp.deb" ]; then
+            mv "release/gotohp.deb" "release/gotohp_amd64.deb"
+          fi
 
       - name: Build Linux App (Debug)
         if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         run: |
           # Clean bin directory
-          rm -f bin/gotohp-cli
+          rm -f bin/gotohp
 
           # Build debug version
-          task linux:build:cli
+          wails3 build
 
           # Copy debug binary
-          mv bin/gotohp-cli "release/gotohp-cli_amd64_debug"
+          cp bin/gotohp "release/gotohp_amd64_debug"
 
-      - name: Upload Linux Artifact
+      - name: Upload Linux Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-artifact
+          name: linux-release
           path: |
+            release/gotohp_amd64.deb
+            release/gotohp_amd64.AppImage
             release/gotohp-cli_amd64
-            release/gotohp-cli_amd64_debug
+            release/gotohp-cli_amd64.deb
+
+      - name: Upload Linux Debug Artifact
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_debug) || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-debug
+          path: release/gotohp_amd64_debug
 
       - name: Upload to Draft Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            release/gotohp_amd64.deb
+            release/gotohp_amd64.AppImage
             release/gotohp-cli_amd64
-            release/gotohp-cli_amd64_debug
+            release/gotohp-cli_amd64.deb
           tag_name: ${{ steps.set-tag.outputs.tag_name }}
           name: ${{ steps.set-tag.outputs.release_name }}
           body: ${{ steps.set-tag.outputs.release_body }}

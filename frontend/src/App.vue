@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   Sheet,
@@ -6,8 +7,9 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet'
 import { useColorMode } from '@vueuse/core'
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { ConfigManager } from '../bindings/app/backend'
+import { Events } from '@wailsio/runtime'
 import Button from "./components/ui/button/Button.vue"
 import EditableSelect from "./components/ui/EditableSelect.vue"
 import './index.css'
@@ -15,8 +17,9 @@ import SettingsPanel from "./SettingsPanel.vue"
 import Upload from './Upload.vue'
 import Gallery from './Gallery.vue'
 import { uploadManager } from './utils/UploadManager'
+import Toaster from './components/ui/sonner/Sonner.vue'
 
-import { toast, Toaster } from "vue-sonner"
+import { toast } from "vue-sonner"
 
 useColorMode().value = "dark"
 
@@ -24,9 +27,20 @@ const { state: uploadState } = uploadManager
 const copyButtonText = ref('Copy as JSON');
 const activeView = ref('upload')
 
+// Drag state for dual drop zones
+const isDraggingFiles = ref(false)
+
+// Album upload flow state
+const showAlbumInput = ref(false)
+const pendingFiles = ref<string[]>([])
+const pendingFileCount = ref(0)
+
 const selectedOption = ref('')
 const options = ref<string[]>([])
 const credentialMap = ref<Record<string, string>>({})
+const albumNameOrKey = ref('')
+const tokenBindingEmail = ref('')
+const isExtractingTokenBinding = ref(false)
 
 function extractEmailFromCredential(credential: string): string | null {
   try {
@@ -42,13 +56,28 @@ watch(selectedOption, async (newValue) => {
   if (newValue) {
     try {
       await ConfigManager.SetSelected(newValue)
+      await updateTokenBindingPrompt(newValue)
       console.log('Successfully updated selected value:', newValue)
     } catch (error) {
       console.error('Failed to update selected value:', error)
       toast.error('Failed to update selected account.')
     }
+  } else {
+    tokenBindingEmail.value = ''
   }
 })
+
+async function updateTokenBindingPrompt(email: string) {
+  const credential = credentialMap.value[email]
+  if (!credential) {
+    tokenBindingEmail.value = ''
+    return
+  }
+
+  tokenBindingEmail.value = await ConfigManager.CredentialNeedsTokenBinding(credential)
+    ? email
+    : ''
+}
 
 async function addCredentials(authString: string) {
   try {
@@ -61,15 +90,56 @@ async function addCredentials(authString: string) {
         options.value = [...options.value, email]
       }
       selectedOption.value = email
+      await updateTokenBindingPrompt(email)
     }
     toast.success('Credentials added successfully!')
     return true
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Failed to add credentials:', error)
     toast.error('Failed to add credentials', {
-      description: error?.message,
+      description: error instanceof Error ? error.message : String(error),
     })
     return false
+  }
+}
+
+async function refreshCredentials() {
+  const config = await ConfigManager.GetConfig()
+  credentialMap.value = {}
+  options.value = []
+
+  if (config.credentials?.length) {
+    config.credentials.forEach(credential => {
+      const email = extractEmailFromCredential(credential)
+      if (email) {
+        credentialMap.value[email] = credential
+        options.value.push(email)
+      }
+    })
+  }
+
+  if (config.selected) {
+    selectedOption.value = config.selected
+    await updateTokenBindingPrompt(config.selected)
+  }
+}
+
+async function addTokenBindingAliasFromADB() {
+  if (!tokenBindingEmail.value) return
+
+  isExtractingTokenBinding.value = true
+  try {
+    await ConfigManager.AddTokenBindingAliasFromADB(tokenBindingEmail.value)
+    await refreshCredentials()
+    tokenBindingEmail.value = ''
+    toast.success('Token binding key added.')
+  } catch (error) {
+    console.error('Failed to add token binding key:', error)
+    toast.error('Failed to add token binding key', {
+      description: error instanceof Error ? error.message : String(error),
+    })
+  } finally {
+    isExtractingTokenBinding.value = false
   }
 }
 
@@ -83,6 +153,9 @@ async function removeCredentials(email: string) {
       if (selectedOption.value === email) {
         selectedOption.value = ''
       }
+      if (tokenBindingEmail.value === email) {
+        tokenBindingEmail.value = ''
+      }
     }
     toast.success('Credentials removed.')
     return true
@@ -94,23 +167,8 @@ async function removeCredentials(email: string) {
 }
 
 onMounted(async () => {
-  const config = await ConfigManager.GetConfig()
-  if (config.credentials?.length) {
-    credentialMap.value = {}
-    options.value = []
+  await refreshCredentials()
 
-    config.credentials.forEach(credential => {
-      const email = extractEmailFromCredential(credential)
-      if (email) {
-        credentialMap.value[email] = credential
-        options.value.push(email)
-      }
-    })
-
-    if (config.selected) {
-      selectedOption.value = config.selected
-    }
-  }
 })
 
 const handleCopyClick = () => {
@@ -118,16 +176,268 @@ const handleCopyClick = () => {
   copyButtonText.value = 'Copied!';
   setTimeout(() => copyButtonText.value = 'Copy as JSON', 1000);
 };
+
+
+
+// Global drag event handlers to detect file dragging
+let dragLeaveTimeout: ReturnType<typeof setTimeout> | null = null
+
+const onDragEnter = (e: DragEvent) => {
+  if (!e.dataTransfer?.types.includes('Files')) return
+  
+  // Clear any pending drag leave timeout
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+    dragLeaveTimeout = null
+  }
+  
+  isDraggingFiles.value = true
+}
+
+const onDragOver = (e: DragEvent) => {
+  if (!e.dataTransfer?.types.includes('Files')) return
+  e.preventDefault()
+  
+  // Clear any pending drag leave timeout - we're still dragging
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+    dragLeaveTimeout = null
+  }
+}
+
+const onDragLeave = (e: DragEvent) => {
+  if (!e.dataTransfer?.types.includes('Files')) return
+  
+  // Use timeout to detect if we've truly left the window
+  // dragover will cancel this if we're still in the window
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+  }
+  dragLeaveTimeout = setTimeout(() => {
+    isDraggingFiles.value = false
+    dragLeaveTimeout = null
+  }, 50)
+}
+
+const onDrop = () => {
+  // Clear any pending timeout
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+    dragLeaveTimeout = null
+  }
+  
+  // Delay resetting isDraggingFiles to allow Wails to process the drop target
+  // before Vue re-renders and hides the drop zones
+  setTimeout(() => {
+    isDraggingFiles.value = false
+  }, 100)
+}
+
+// Album upload confirmation
+const confirmAlbumUpload = async () => {
+  // Set album name in backend (not persisted to disk)
+  await ConfigManager.SetAlbumName(albumNameOrKey.value)
+  await ConfigManager.SetAlbumAutoMode(false)
+  // Start upload with pending files
+  Events.Emit('startUpload', { files: pendingFiles.value })
+  showAlbumInput.value = false
+  pendingFiles.value = []
+  pendingFileCount.value = 0
+  albumNameOrKey.value = '' // Reset for next upload
+}
+
+const cancelAlbumUpload = () => {
+  showAlbumInput.value = false
+  pendingFiles.value = []
+  pendingFileCount.value = 0
+  albumNameOrKey.value = '' // Reset on cancel too
+}
+
+// Handle album error event
+const albumErrorHandler = (e: Event) => {
+  const event = e as CustomEvent<{ AlbumName: string; Error: string }>
+  const { AlbumName, Error } = event.detail
+  // Check if it's a 404 error (album key not found)
+  if (Error.includes('404')) {
+    toast.error('Album not found', {
+      description: `The album key "${AlbumName}" does not exist or is invalid.`,
+    })
+  } else {
+    toast.error('Failed to create album', {
+      description: `Album "${AlbumName}": ${Error}`,
+    })
+  }
+}
+
+const uploadErrorHandler = (e: Event) => {
+  const event = e as CustomEvent<{ FileName: string; Message: string }>
+  const { FileName, Message } = event.detail
+  const errorMessage = Message.replace(/^Error:\s*/, '')
+  toast.error(FileName ? `Upload failed: ${FileName}` : 'Upload failed', {
+    description: errorMessage,
+    duration: 10000,
+    important: true,
+  })
+}
+
+onMounted(() => {
+  document.addEventListener('dragenter', onDragEnter)
+  document.addEventListener('dragleave', onDragLeave)
+  document.addEventListener('dragover', onDragOver)
+  document.addEventListener('drop', onDrop)
+  window.addEventListener('albumError', albumErrorHandler)
+  window.addEventListener('uploadError', uploadErrorHandler)
+
+  // Listen for files-dropped event from backend
+  Events.On('files-dropped', (event: { data: { files: string[]; dropZone: string } }) => {
+    const { files, dropZone } = event.data
+
+    if (dropZone === 'album') {
+      // Show album input screen
+      pendingFiles.value = files
+      pendingFileCount.value = files.length
+      showAlbumInput.value = true
+    } else if (dropZone === 'auto-album') {
+      // Auto album mode - create albums based on folder names
+      ConfigManager.SetAlbumName('')
+      ConfigManager.SetAlbumAutoMode(true)
+      Events.Emit('startUpload', { files })
+    } else {
+      // Regular upload (no album)
+      ConfigManager.SetAlbumName('')
+      ConfigManager.SetAlbumAutoMode(false)
+      Events.Emit('startUpload', { files })
+    }
+  })
+})
+
+onUnmounted(() => {
+  document.removeEventListener('dragenter', onDragEnter)
+  document.removeEventListener('dragleave', onDragLeave)
+  document.removeEventListener('dragover', onDragOver)
+  document.removeEventListener('drop', onDrop)
+  window.removeEventListener('albumError', albumErrorHandler)
+  window.removeEventListener('uploadError', uploadErrorHandler)
+  if (dragLeaveTimeout) {
+    clearTimeout(dragLeaveTimeout)
+  }
+})
 </script>
 
 <template>
-  <main class="w-screen h-screen flex flex-col items-center" style="--wails-draggable: none">
-    <div v-if="!uploadState.isUploading" class="w-full h-full flex flex-col">
+  <main
+    class="w-screen h-screen flex flex-col items-center"
+    style="--wails-draggable: none"
+  >
+    <!-- Drop zones shown when dragging files (only in upload view) -->
+    <div
+      v-if="!uploadState.isUploading && isDraggingFiles && options.length > 0 && activeView === 'upload'"
+      class="w-screen h-screen flex flex-col gap-3 p-6"
+      style="--wails-draggable: none"
+    >
+      <div
+        data-file-drop-target
+        data-drop-zone="regular"
+        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
+      >
+        <h2 class="text-xl font-semibold select-none text-muted-foreground">
+          Upload Only
+        </h2>
+        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
+          Upload files without adding to any album
+        </p>
+      </div>
+      <div
+        data-file-drop-target
+        data-drop-zone="album"
+        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
+      >
+        <h2 class="text-xl font-semibold select-none text-muted-foreground">
+          Upload to Album
+        </h2>
+        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
+          Upload and add to a specific album (you'll enter the name)
+        </p>
+      </div>
+      <div
+        data-file-drop-target
+        data-drop-zone="auto-album"
+        class="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-muted-foreground/50 rounded-xl transition-all duration-200 drop-zone"
+      >
+        <h2 class="text-xl font-semibold select-none text-muted-foreground">
+          Auto Album
+        </h2>
+        <p class="text-sm text-muted-foreground/70 mt-2 select-none text-center px-4">
+          Upload and create albums automatically based on folder names
+        </p>
+      </div>
+    </div>
+
+    <!-- Normal UI (not dragging) -->
+    <div
+      v-else-if="!uploadState.isUploading"
+      class="w-full h-full flex flex-col"
+    >
       <template v-if="options.length === 0">
-        <div class="w-full h-full flex flex-col items-center gap-4 max-w-md pt-30">
-          <EditableSelect v-model="selectedOption" :options="options"
-            @update:options="(newOptions) => options = newOptions" @item-added="addCredentials"
-            @item-removed="removeCredentials" />
+        <div class="w-full h-full flex flex-col items-center gap-4 max-w-md mx-auto pt-30">
+          <EditableSelect
+            v-model="selectedOption"
+            :options="options"
+            @update:options="(newOptions) => options = newOptions"
+            @item-added="addCredentials"
+            @item-removed="removeCredentials"
+          />
+          <div
+            v-if="tokenBindingEmail"
+            class="w-full max-w-xs border rounded-lg p-3 flex flex-col gap-3"
+            style="--wails-draggable: none"
+          >
+            <p class="text-sm text-muted-foreground">
+              This credential needs a token binding key from the rooted Android device it was captured from.
+            </p>
+            <Button
+              class="cursor-pointer select-none"
+              :disabled="isExtractingTokenBinding"
+              @click="addTokenBindingAliasFromADB"
+            >
+              {{ isExtractingTokenBinding ? 'Reading ADB...' : 'Read from ADB' }}
+            </Button>
+          </div>
+        </div>
+      </template>
+
+      <template v-else-if="showAlbumInput">
+        <div
+          class="w-full h-full flex flex-col items-center justify-center gap-6 p-8"
+          style="--wails-draggable: none"
+        >
+          <h1 class="text-xl font-semibold select-none">
+            Upload to Album
+          </h1>
+          <p class="text-muted-foreground select-none">
+            {{ pendingFileCount }} file(s) ready to upload
+          </p>
+          <div class="flex flex-col gap-2 w-full max-w-xs">
+            <Label for="album-input" class="text-muted-foreground text-sm">Album name or key</Label>
+            <Input
+              id="album-input"
+              v-model="albumNameOrKey"
+              placeholder="Album name or AF1Qip... key"
+              autofocus
+            />
+          </div>
+          <div class="flex gap-4">
+            <Button variant="outline" class="cursor-pointer select-none" @click="cancelAlbumUpload">
+              Cancel
+            </Button>
+            <Button
+              class="cursor-pointer select-none"
+              :disabled="!albumNameOrKey.trim()"
+              @click="confirmAlbumUpload"
+            >
+              Upload
+            </Button>
+          </div>
         </div>
       </template>
 
@@ -136,27 +446,30 @@ const handleCopyClick = () => {
         <div class="relative flex items-center justify-between p-4 border-b">
           <div class="absolute inset-0" style="--wails-draggable: drag"></div>
           <div class="relative flex gap-2" style="--wails-draggable: none">
-            <Button 
-              :variant="activeView === 'upload' ? 'default' : 'outline'" 
-              @click="activeView = 'upload'"
+            <Button
+              :variant="activeView === 'upload' ? 'default' : 'outline'"
               class="cursor-pointer select-none"
+              @click="activeView = 'upload'"
             >
               Upload
             </Button>
-            <Button 
-              :variant="activeView === 'gallery' ? 'default' : 'outline'" 
-              @click="activeView = 'gallery'"
+            <Button
+              :variant="activeView === 'gallery' ? 'default' : 'outline'"
               class="cursor-pointer select-none"
+              @click="activeView = 'gallery'"
             >
               Gallery
             </Button>
           </div>
 
           <div class="relative flex items-center gap-2" style="--wails-draggable: none">
-            <EditableSelect v-model="selectedOption" :options="options"
-              @update:options="(newOptions) => options = newOptions" @item-added="addCredentials"
-              @item-removed="removeCredentials" />
-            
+            <EditableSelect
+              v-model="selectedOption"
+              :options="options"
+              @update:options="(newOptions) => options = newOptions"
+              @item-added="addCredentials"
+              @item-removed="removeCredentials"
+            />
             <Sheet>
               <SheetTrigger>
                 <Button variant="outline" class="cursor-pointer select-none">
@@ -171,17 +484,43 @@ const handleCopyClick = () => {
         </div>
 
         <!-- Content area -->
-        <div class="flex-1 overflow-auto" :data-wails-dropzone="activeView === 'upload' ? '' : undefined">
-          <div v-if="activeView === 'upload'" class="w-full h-full flex flex-col items-center gap-4 max-w-md mx-auto pt-20">
+        <div class="flex-1 overflow-auto">
+          <div
+            v-if="activeView === 'upload'"
+            class="w-full h-full flex flex-col items-center gap-4 max-w-md mx-auto pt-20"
+            data-file-drop-target
+          >
             <h1 class="text-xl font-semibold select-none">
               Drop files to upload
             </h1>
-
-            <div v-if="uploadState.uploadedFiles > 0" class="flex flex-col items-center gap-2 border rounded-lg p-5 mt-5">
+            <div
+              v-if="tokenBindingEmail"
+              class="w-full max-w-xs border rounded-lg p-3 flex flex-col gap-3"
+              style="--wails-draggable: none"
+            >
+              <p class="text-sm text-muted-foreground">
+                This credential needs a token binding key from the rooted Android device it was captured from.
+              </p>
+              <Button
+                class="cursor-pointer select-none"
+                :disabled="isExtractingTokenBinding"
+                @click="addTokenBindingAliasFromADB"
+              >
+                {{ isExtractingTokenBinding ? 'Reading ADB...' : 'Read from ADB' }}
+              </Button>
+            </div>
+            <div
+              v-if="uploadState.uploadedFiles > 0"
+              class="flex flex-col items-center gap-2 border rounded-lg p-5 mt-5"
+            >
               <h2 class="text-l font-semibold select-none">Upload Results</h2>
               <Label class="text-muted-foreground">Successful: {{ uploadState.results.success.length }}</Label>
               <Label class="text-muted-foreground">Failed: {{ uploadState.results.fail.length }}</Label>
-              <Button variant="outline" class="cursor-pointer select-none min-w-[125px]" @click="handleCopyClick">
+              <Button
+                variant="outline"
+                class="cursor-pointer select-none min-w-[125px]"
+                @click="handleCopyClick"
+              >
                 {{ copyButtonText }}
               </Button>
             </div>
@@ -191,9 +530,17 @@ const handleCopyClick = () => {
         </div>
       </template>
     </div>
-    <div v-if="uploadState.isUploading" class="w-full">
+    <div
+      v-if="uploadState.isUploading"
+      class="w-full h-full"
+    >
       <Upload />
     </div>
-    <Toaster position="bottom-center" />
+    <Toaster
+      position="bottom-center"
+      rich-colors
+      expand
+      :visible-toasts="4"
+    />
   </main>
 </template>

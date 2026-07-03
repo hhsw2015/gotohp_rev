@@ -1,17 +1,45 @@
+import { Clipboard, Events } from "@wailsio/runtime";
 import { reactive } from "vue";
-import { Events, Clipboard } from "@wailsio/runtime";
+
+export interface ThreadStatus {
+  WorkerID: number;
+  Status: string;
+  FilePath: string;
+  FileName: string;
+  Message: string;
+  BytesUploaded: number;
+  BytesTotal: number;
+  Attempt: number;
+}
+
+export interface FileUploadResult {
+  MediaKey: string;
+  IsError: boolean;
+  ErrorMessage: string;
+  Path: string;
+}
+
+export interface UploadBatchStart {
+  Total: number;
+  TotalBytes: number;
+}
 
 export interface UploadSuccess {
   path: string;
   mediaKey: string;
 }
 
-export interface ThreadStatus {
-  WorkerID: number;
-  Status: string; // "idle", "hashing", "checking", "uploading", "finalizing", "completed", "error"
-  FilePath: string;
-  FileName: string;
-  Message: string;
+export interface AlbumStatus {
+  AlbumName: string;
+  ItemsAdded: number;
+  TotalItems: number;
+  AlbumKeys: string[];
+  IsComplete: boolean;
+}
+
+export interface AlbumError {
+  AlbumName: string;
+  Error: string;
 }
 
 export interface UploadState {
@@ -23,6 +51,16 @@ export interface UploadState {
     success: UploadSuccess[];
     fail: string[];
   };
+  // Byte tracking
+  totalBytes: number;
+  uploadedBytes: number;
+  // Timing
+  startTime: number;
+  // Speed calculation (bytes per second)
+  uploadSpeed: number;
+  // Album creation
+  albumStatus: AlbumStatus | null;
+  isCreatingAlbum: boolean;
 }
 
 class UploadManager {
@@ -38,7 +76,22 @@ class UploadManager {
       success: [],
       fail: [],
     },
+    totalBytes: 0,
+    uploadedBytes: 0,
+    startTime: 0,
+    uploadSpeed: 0,
+    albumStatus: null,
+    isCreatingAlbum: false,
   });
+
+  // For speed calculation
+  private lastSpeedUpdate: number = 0;
+  private lastBytesUploaded: number = 0;
+  private speedSamples: number[] = [];
+  // Track bytes from completed files
+  private completedBytes: number = 0;
+  // Track the last known BytesTotal for each file
+  private fileBytes: Map<string, number> = new Map();
 
   private constructor() {
     // Bind all methods to ensure 'this' context is preserved
@@ -58,36 +111,126 @@ class UploadManager {
 
   private setupEventListeners() {
     // Handle upload start
-    Events.On("uploadStart", (event: { data: Array<{ Total: number }> }) => {
-      this.state.totalFiles = event.data[0].Total;
+    Events.On("uploadStart", (event: { data: UploadBatchStart }) => {
+      this.state.totalFiles = event.data.Total;
+      this.state.totalBytes = event.data.TotalBytes; // May be 0 initially
       this.state.uploadedFiles = 0;
+      this.state.uploadedBytes = 0;
       this.state.isUploading = true;
       this.state.threads.clear();
+      this.state.startTime = Date.now();
+      this.state.uploadSpeed = 0;
+      this.lastSpeedUpdate = Date.now();
+      this.lastBytesUploaded = 0;
+      this.speedSamples = [];
+      this.completedBytes = 0;
+      this.fileBytes.clear();
       this.resetUploadResults();
     });
 
+    // Handle async total bytes update (calculated after uploadStart)
+    Events.On("uploadTotalBytes", (event: { data: number }) => {
+      this.state.totalBytes = event.data;
+    });
+
     // Handle thread status updates
-    Events.On("ThreadStatus", (event: { data: Array<ThreadStatus> }) => {
-      const threadStatus = event.data[0];
-      this.state.threads.set(threadStatus.WorkerID, threadStatus);
+    Events.On("ThreadStatus", (event: { data: ThreadStatus }) => {
+      const thread = event.data;
+      const prevThread = this.state.threads.get(thread.WorkerID);
+
+      if (thread.Status === 'uploading' && thread.FilePath && thread.BytesTotal > 0) {
+        this.fileBytes.set(thread.FilePath, thread.BytesTotal);
+      }
+
+      if (thread.Status === 'error' && prevThread?.Message !== thread.Message) {
+        window.dispatchEvent(new CustomEvent('uploadError', { detail: thread }));
+      }
+      
+      this.state.threads.set(thread.WorkerID, thread);
+      this.updateBytesAndSpeed();
     });
 
     // Handle file status updates
-    Events.On("FileStatus", (event: { data: Array<{ IsError: boolean; Path: string; MediaKey: string }> }) => {
-      const { IsError, Path, MediaKey } = event.data[0];
+    Events.On("FileStatus", (event: { data: FileUploadResult }) => {
+      const { IsError, Path, MediaKey } = event.data;
 
       if (!IsError) {
         this.state.uploadedFiles += 1;
         this.state.results.success.push({ path: Path, mediaKey: MediaKey });
+        const completedFileBytes = this.fileBytes.get(Path);
+        if (completedFileBytes && completedFileBytes > 0) {
+          this.completedBytes += completedFileBytes;
+        }
       } else {
-        this.state.results.fail.push(Path);
+        const errorMessage = event.data.ErrorMessage;
+        this.state.results.fail.push(errorMessage ? `${Path}: ${errorMessage}` : Path);
       }
+      this.fileBytes.delete(Path);
+      this.updateBytesAndSpeed();
     });
 
     // Handle upload stop
     Events.On("uploadStop", () => {
       this.state.isUploading = false;
     });
+
+    // Handle album creation progress
+    Events.On("albumProgress", (event: { data: AlbumStatus }) => {
+      this.state.albumStatus = event.data;
+      this.state.isCreatingAlbum = true;
+    });
+
+    // Handle album creation complete
+    Events.On("albumComplete", (event: { data: AlbumStatus }) => {
+      this.state.albumStatus = event.data;
+      this.state.isCreatingAlbum = false;
+    });
+
+    // Handle album creation error
+    Events.On("albumError", (event: { data: AlbumError }) => {
+      this.state.isCreatingAlbum = false;
+      // Emit a custom event that App.vue can listen to for showing toast
+      window.dispatchEvent(new CustomEvent('albumError', { detail: event.data }));
+    });
+  }
+
+  private updateBytesAndSpeed() {
+    // Calculate bytes from currently active uploads
+    let activeUploadedBytes = 0;
+
+    this.state.threads.forEach((thread) => {
+      if (thread.Status === 'uploading' && thread.BytesTotal > 0) {
+        activeUploadedBytes += thread.BytesUploaded;
+      } else if (thread.Status === 'finalizing' && thread.FilePath) {
+        activeUploadedBytes += this.fileBytes.get(thread.FilePath) ?? 0;
+      }
+    });
+
+    // Total uploaded = completed files + current progress
+    const totalUploaded = this.completedBytes + activeUploadedBytes;
+    this.state.uploadedBytes = totalUploaded;
+
+    // Calculate speed (using rolling average)
+    const now = Date.now();
+    const timeDelta = now - this.lastSpeedUpdate;
+
+    if (timeDelta >= 500) { // Update speed every 500ms
+      const bytesDelta = totalUploaded - this.lastBytesUploaded;
+      const instantSpeed = (bytesDelta / timeDelta) * 1000; // bytes per second
+
+      if (instantSpeed >= 0) {
+        this.speedSamples.push(instantSpeed);
+        // Keep last 5 samples for smoothing
+        if (this.speedSamples.length > 5) {
+          this.speedSamples.shift();
+        }
+        // Calculate average speed
+        this.state.uploadSpeed = this.speedSamples.reduce((a, b) => a + b, 0) / this.speedSamples.length;
+      }
+
+      this.lastSpeedUpdate = now;
+      this.lastBytesUploaded = totalUploaded;
+    }
   }
 
   public resetUploadResults() {

@@ -1,14 +1,12 @@
 package backend
 
 import (
-	"app/generated"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"app/generated"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -118,7 +118,7 @@ func NewApi() (*Api, error) {
 	}
 
 	if len(credentials) == 0 {
-		return nil, fmt.Errorf("no credentials with matching selcted email found")
+		return nil, fmt.Errorf("no credentials with matching selected email found")
 	}
 
 	client, err := NewHTTPClientWithProxy(AppConfig.Proxy)
@@ -188,21 +188,25 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 		return nil, fmt.Errorf("failed to parse auth data: %w", err)
 	}
 
-	authRequestData := url.Values{
-		"androidId":                    {authDataValues.Get("androidId")},
-		"app":                          {"com.google.android.apps.photos"},
-		"client_sig":                   {authDataValues.Get("client_sig")},
-		"callerPkg":                    {"com.google.android.apps.photos"},
-		"callerSig":                    {authDataValues.Get("callerSig")},
-		"device_country":               {authDataValues.Get("device_country")},
-		"Email":                        {authDataValues.Get("Email")},
-		"google_play_services_version": {authDataValues.Get("google_play_services_version")},
-		"lang":                         {authDataValues.Get("lang")},
-		"oauth2_foreground":            {authDataValues.Get("oauth2_foreground")},
-		"sdk_version":                  {authDataValues.Get("sdk_version")},
-		"service":                      {authDataValues.Get("service")},
-		"Token":                        {authDataValues.Get("Token")},
+	authRequestData := url.Values{}
+	for key, values := range authDataValues {
+		authRequestData[key] = append([]string(nil), values...)
 	}
+	authRequestData.Set("app", "com.google.android.apps.photos")
+	authRequestData.Set("callerPkg", "com.google.android.apps.photos")
+	authRequestData.Del("it_caveat_types")
+	authRequestData.Del("assertion_jwt")
+
+	var tokenBinding *tokenBindingSession
+	if alias := authRequestData.Get("token_binding_alias"); alias != "" {
+		var assertionJWT string
+		tokenBinding, assertionJWT, err = newTokenBindingSession(alias)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare token binding assertion: %w", err)
+		}
+		authRequestData.Set("assertion_jwt", assertionJWT)
+	}
+	authRequestData.Del("token_binding_alias")
 
 	headers := map[string]string{
 		"Accept-Encoding": "gzip",
@@ -218,7 +222,6 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 		"https://android.googleapis.com/auth",
 		strings.NewReader(authRequestData.Encode()),
 	)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -231,24 +234,16 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("auth request failed after retries: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return make(map[string]string), fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Handle gzip encoding if present
-	var reader io.Reader
-	reader, err = gzip.NewReader(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer reader.(*gzip.Reader).Close()
-
 	// Parse the response body
-	bodyBytes, err := io.ReadAll(reader)
+	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -264,6 +259,9 @@ func (a *Api) getAuthToken() (map[string]string, error) {
 		if len(parts) == 2 {
 			parsedAuthResponse[parts[0]] = parts[1]
 		}
+	}
+	if err := decryptTokenEncryptedResponse(parsedAuthResponse, tokenBinding); err != nil {
+		return nil, err
 	}
 
 	// Validate we got the required fields
@@ -346,11 +344,11 @@ func (a *Api) GetUploadToken(shaHashB64 string, fileSize int64) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -418,30 +416,23 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var reader io.Reader
-	reader, err = gzip.NewReader(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer reader.(*gzip.Reader).Close()
-
 	// Parse the response body
-	bodyBytes, err := io.ReadAll(reader)
+	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var pbResp generated.RemoteMatches
 	if err := proto.Unmarshal(bodyBytes, &pbResp); err != nil {
-		log.Fatalf("Failed to unmarshal protobuf: %v", err)
+		return "", fmt.Errorf("failed to unmarshal protobuf: %w", err)
 	}
 
 	mediaKey := pbResp.GetMediaKey()
@@ -449,21 +440,92 @@ func (a *Api) FindRemoteMediaByHash(shaHash []byte) (string, error) {
 	return mediaKey, nil
 }
 
+// UploadProgressCallback is called with progress updates during file upload
+// attempt is 1-based (1 = first attempt, 2 = first retry, etc.)
+type UploadProgressCallback func(bytesUploaded, bytesTotal int64, attempt int)
+
 func (a *Api) UploadFile(ctx context.Context, filePath string, uploadToken string) (*generated.CommitToken, error) {
-	file, err := os.Open(filePath)
+	return a.UploadFileWithProgress(ctx, filePath, uploadToken, nil)
+}
+
+func (a *Api) UploadFileWithProgress(ctx context.Context, filePath string, uploadToken string, onProgress UploadProgressCallback) (*generated.CommitToken, error) {
+	// Get file size first (needed for progress tracking)
+	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file: %w", err)
+		return nil, fmt.Errorf("error getting file info: %w", err)
 	}
-	defer file.Close()
+	fileSize := fileInfo.Size()
 
 	uploadURL := "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=" + uploadToken
+	retryConfig := DefaultRetryConfig()
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL, file)
+	var lastErr error
+	for attempt := 0; attempt <= retryConfig.MaxRetries; attempt++ {
+		attemptNum := attempt + 1 // 1-based for display
+
+		// Check context before each attempt
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// Wait before retry (skip on first attempt)
+		if attempt > 0 {
+			delay := CalculateBackoff(attempt-1, retryConfig)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		// Signal start of this attempt (resets progress on retry)
+		if onProgress != nil {
+			onProgress(0, fileSize, attemptNum)
+		}
+
+		// Open file fresh for each attempt - this is the key to not loading into memory
+		file, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("error opening file: %w", err)
+		}
+
+		// Wrap file in progress reader if callback provided
+		var reader io.Reader = file
+		if onProgress != nil {
+			reader = NewProgressReader(file, fileSize, func(bytesRead, total int64) {
+				onProgress(bytesRead, total, attemptNum)
+			})
+		}
+
+		result, err := a.doUploadRequest(ctx, uploadURL, reader)
+		closeErr := file.Close() // Close file after request completes (success or fail)
+		if err == nil && closeErr != nil {
+			return nil, fmt.Errorf("error closing file: %w", closeErr)
+		}
+
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+
+		// Don't retry on context cancellation
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("upload failed after %d attempts: %w", retryConfig.MaxRetries+1, lastErr)
+}
+
+// doUploadRequest performs a single upload attempt
+func (a *Api) doUploadRequest(ctx context.Context, uploadURL string, reader io.Reader) (*generated.CommitToken, error) {
+	req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL, reader)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	// Important: Don't set ContentLength to enable chunked transfer encoding
+	// Use chunked transfer encoding (don't set ContentLength)
 	req.ContentLength = -1
 
 	bearerToken, err := a.BearerToken()
@@ -471,29 +533,24 @@ func (a *Api) UploadFile(ctx context.Context, filePath string, uploadToken strin
 		return nil, fmt.Errorf("failed to get bearer token: %w", err)
 	}
 
-	headers := map[string]string{
-		"Accept-Encoding": "gzip",
-		"Accept-Language": a.language,
-		"User-Agent":      a.userAgent,
-		"Authorization":   "Bearer " + bearerToken,
-	}
-
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Accept-Language", a.language)
+	req.Header.Set("User-Agent", a.userAgent)
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
 
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
+	// Check for non-success status codes (includes retryable 5xx/429 and non-retryable 4xx)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -564,13 +621,28 @@ func (a *Api) CommitUpload(
 		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
 	}
 
-	// Get the bearer token
+	retryConfig := DefaultRetryConfig()
+	var lastErr error
+	for attempt := 0; attempt <= retryConfig.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := CalculateBackoff(attempt-1, retryConfig)
+			time.Sleep(delay)
+		}
+		mediaKey, err := a.doCommitRequest(serializedData, userAgent)
+		if err == nil {
+			return mediaKey, nil
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("commit failed after %d attempts: %w", retryConfig.MaxRetries+1, lastErr)
+}
+
+func (a *Api) doCommitRequest(serializedData []byte, userAgent string) (string, error) {
 	bearerToken, err := a.BearerToken()
 	if err != nil {
 		return "", fmt.Errorf("failed to get bearer token: %w", err)
 	}
 
-	// Prepare headers
 	headers := map[string]string{
 		"accept-Encoding":          "gzip",
 		"accept-Language":          a.language,
@@ -581,10 +653,102 @@ func (a *Api) CommitUpload(
 		"x-goog-ext-174067345-bin": "CgIIAg==",
 	}
 
+	req, err := http.NewRequest("POST",
+		"https://photosdata-pa.googleapis.com/6439526531001121323/16538846908252377752",
+		bytes.NewReader(serializedData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := ReadResponseBody(resp)
+		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	bodyBytes, err := ReadResponseBody(resp)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var pbResp generated.CommitUploadResponse
+	if err := proto.Unmarshal(bodyBytes, &pbResp); err != nil {
+		return "", fmt.Errorf("failed to unmarshal protobuf: %w", err)
+	}
+
+	if pbResp.GetField1() == nil || pbResp.GetField1().GetField3() == nil {
+		return "", fmt.Errorf("upload rejected by API: invalid response structure")
+	}
+	mediaKey := pbResp.GetField1().GetField3().GetMediaKey()
+	if mediaKey == "" {
+		return "", fmt.Errorf("upload rejected by API: no media key returned")
+	}
+	return mediaKey, nil
+}
+
+// CreateAlbum creates a new album with the given name and initial media items.
+// Returns the album media key for subsequent AddMediaToAlbum calls.
+func (a *Api) CreateAlbum(albumName string, mediaKeys []string) (string, error) {
+	// Build media keys structure
+	protoMediaKeys := make([]*generated.CreateAlbumField4Type, len(mediaKeys))
+	for i, key := range mediaKeys {
+		protoMediaKeys[i] = &generated.CreateAlbumField4Type{
+			Field1: &generated.CreateAlbumField4TypeField1Type{
+				MediaKey: key,
+			},
+		}
+	}
+
+	// Create the protobuf message
+	protoBody := generated.CreateAlbum{
+		AlbumName: albumName,
+		Timestamp: time.Now().Unix(),
+		Field3:    1,
+		MediaKeys: protoMediaKeys,
+		Field6:    &generated.CreateAlbumField6Type{},
+		Field7:    &generated.CreateAlbumField7Type{Field1: 3},
+		DeviceInfo: &generated.CreateAlbumField8Type{
+			Model:             a.model,
+			Make:              a.make,
+			AndroidApiVersion: a.androidAPIVersion,
+		},
+	}
+
+	// Serialize the protobuf message
+	serializedData, err := proto.Marshal(&protoBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal protobuf: %w", err)
+	}
+
+	// Get the bearer token
+	bearerToken, err := a.BearerToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to get bearer token: %w", err)
+	}
+
+	// Prepare headers
+	headers := map[string]string{
+		"Accept-Encoding":          "gzip",
+		"Accept-Language":          a.language,
+		"Content-Type":             "application/x-protobuf",
+		"User-Agent":               a.userAgent,
+		"Authorization":            "Bearer " + bearerToken,
+		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
+		"x-goog-ext-174067345-bin": "CgIIAg==",
+	}
+
 	// Create the request
 	req, err := http.NewRequest(
 		"POST",
-		"https://photosdata-pa.googleapis.com/6439526531001121323/16538846908252377752",
+		"https://photosdata-pa.googleapis.com/6439526531001121323/8386163679468898444",
 		bytes.NewReader(serializedData),
 	)
 	if err != nil {
@@ -601,46 +765,105 @@ func (a *Api) CommitUpload(
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Check for errors
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ReadResponseBody(resp)
 		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Handle gzip response if needed
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		reader, err = gzip.NewReader(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer reader.(*gzip.Reader).Close()
-	}
-
 	// Parse the response body
-	bodyBytes, err := io.ReadAll(reader)
+	bodyBytes, err := ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var pbResp generated.CommitUploadResponse
+	var pbResp generated.CreateAlbumResponse
 	if err := proto.Unmarshal(bodyBytes, &pbResp); err != nil {
 		return "", fmt.Errorf("failed to unmarshal protobuf: %w", err)
 	}
 
-	// Get media key from response
-	if pbResp.GetField1() == nil || pbResp.GetField1().GetField3() == nil {
-		return "", fmt.Errorf("upload rejected by API: invalid response structure")
+	// Get album media key from response
+	if pbResp.GetField1() == nil {
+		return "", fmt.Errorf("create album failed: invalid response structure")
 	}
 
-	mediaKey := pbResp.GetField1().GetField3().GetMediaKey()
-	if mediaKey == "" {
-		return "", fmt.Errorf("upload rejected by API: no media key returned")
+	albumMediaKey := pbResp.GetField1().GetAlbumMediaKey()
+	if albumMediaKey == "" {
+		return "", fmt.Errorf("create album failed: no album media key returned")
 	}
 
-	return mediaKey, nil
+	return albumMediaKey, nil
+}
+
+// AddMediaToAlbum adds media items to an existing album.
+func (a *Api) AddMediaToAlbum(albumMediaKey string, mediaKeys []string) error {
+	// Create the protobuf message
+	protoBody := generated.AddMediaToAlbum{
+		MediaKeys:     mediaKeys,
+		AlbumMediaKey: albumMediaKey,
+		Field5:        &generated.AddMediaToAlbumField5Type{Field1: 2},
+		DeviceInfo: &generated.AddMediaToAlbumField6Type{
+			Model:             a.model,
+			Make:              a.make,
+			AndroidApiVersion: a.androidAPIVersion,
+		},
+		Timestamp: time.Now().Unix(),
+	}
+
+	// Serialize the protobuf message
+	serializedData, err := proto.Marshal(&protoBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal protobuf: %w", err)
+	}
+
+	// Get the bearer token
+	bearerToken, err := a.BearerToken()
+	if err != nil {
+		return fmt.Errorf("failed to get bearer token: %w", err)
+	}
+
+	// Prepare headers
+	headers := map[string]string{
+		"Accept-Encoding":          "gzip",
+		"Accept-Language":          a.language,
+		"Content-Type":             "application/x-protobuf",
+		"User-Agent":               a.userAgent,
+		"Authorization":            "Bearer " + bearerToken,
+		"x-goog-ext-173412678-bin": "CgcIAhClARgC",
+		"x-goog-ext-174067345-bin": "CgIIAg==",
+	}
+
+	// Create the request
+	req, err := http.NewRequest(
+		"POST",
+		"https://photosdata-pa.googleapis.com/6439526531001121323/484917746253879292",
+		bytes.NewReader(serializedData),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	// Make the request
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Check for errors
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := ReadResponseBody(resp)
+		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 // CommitUploadOverride commits an upload with explicit client model and quality, bypassing AppConfig-based defaults.

@@ -1,16 +1,23 @@
 package backend
 
 import (
+	"bytes"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/providers/structs"
 	"github.com/knadh/koanf/v2"
+	_ "modernc.org/sqlite"
 )
 
 type Config struct {
@@ -28,21 +35,27 @@ type Config struct {
 	UpdateCheckIntervalSeconds    int      `json:"updateCheckIntervalSeconds" koanf:"update_check_interval_seconds"`
 	AutoWashQuotaItems            bool     `json:"autoWashQuotaItems" koanf:"auto_wash_quota_items"`
 	RequestTrashItems             bool     `json:"requestTrashItems" koanf:"request_trash_items"`
+	AlbumName                     string   `json:"albumName" koanf:"album_name"`
+	AlbumAutoMode                 bool     `json:"albumAutoMode" koanf:"album_auto_mode"`
+	SetDateFromFilename           bool     `json:"setDateFromFilename" koanf:"set_date_from_filename"`
+	ExcludePattern                string   `json:"excludePattern" koanf:"exclude_pattern"`
 }
 
 type ConfigManager struct{}
 
-var AppConfig Config
-var UploadRunning bool = false
-var ConfigPath string
-var DefaultConfig = Config{
-	UploadThreads: 3,
-	ThumbnailSize: "medium",
-	// Disabled by default; user can enable in Settings.
-	UpdateCheckIntervalSeconds: 0,
-	AutoWashQuotaItems:         false,
-	RequestTrashItems:          true,
-}
+var (
+	configMu      sync.RWMutex
+	AppConfig     Config
+	UploadRunning bool = false
+	ConfigPath    string
+	DefaultConfig = Config{
+		UploadThreads:              3,
+		ThumbnailSize:              "medium",
+		UpdateCheckIntervalSeconds: 0,
+		AutoWashQuotaItems:         false,
+		RequestTrashItems:          true,
+	}
+)
 
 // ParseAuthString parses an auth string and returns url.Values (exported for CLI use)
 func ParseAuthString(authString string) (url.Values, error) {
@@ -51,43 +64,43 @@ func ParseAuthString(authString string) (url.Values, error) {
 
 func (g *ConfigManager) SetProxy(proxy string) {
 	AppConfig.Proxy = proxy
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetSelected(email string) {
 	// Parse the auth string
 	AppConfig.Selected = email
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetUseQuota(useQuota bool) {
 	AppConfig.UseQuota = useQuota
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetSaver(saver bool) {
 	AppConfig.Saver = saver
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetRecursive(recursive bool) {
 	AppConfig.Recursive = recursive
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetForceUpload(forceUpload bool) {
 	AppConfig.ForceUpload = forceUpload
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetDeleteFromHost(deleteFromHost bool) {
 	AppConfig.DeleteFromHost = deleteFromHost
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetDisableUnsupportedFilesFilter(disableUnsupportedFilesFilter bool) {
 	AppConfig.DisableUnsupportedFilesFilter = disableUnsupportedFilesFilter
-	saveAppConfig()
+	_ = saveAppConfig()
 }
 
 func (g *ConfigManager) SetUploadThreads(uploadThreads int) {
@@ -95,7 +108,55 @@ func (g *ConfigManager) SetUploadThreads(uploadThreads int) {
 		return
 	}
 	AppConfig.UploadThreads = uploadThreads
-	saveAppConfig()
+	_ = saveAppConfig()
+}
+
+func (g *ConfigManager) SetAlbumName(albumName string) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	AppConfig.AlbumName = strings.TrimSpace(albumName)
+}
+
+func (g *ConfigManager) GetAlbumName() string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.AlbumName
+}
+
+func (g *ConfigManager) SetAlbumAutoMode(autoMode bool) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	AppConfig.AlbumAutoMode = autoMode
+	// Don't persist to disk - this is per-session like AlbumName
+}
+
+func (g *ConfigManager) GetAlbumAutoMode() bool {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.AlbumAutoMode
+}
+
+// GetAlbumConfig returns album name and auto mode atomically
+func GetAlbumConfig() (albumName string, autoMode bool) {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.AlbumName, AppConfig.AlbumAutoMode
+}
+
+func (g *ConfigManager) SetSetDateFromFilename(v bool) {
+	AppConfig.SetDateFromFilename = v
+	_ = saveAppConfig()
+}
+
+func (g *ConfigManager) SetExcludePattern(pattern string) {
+	AppConfig.ExcludePattern = pattern
+	_ = saveAppConfig()
+}
+
+func (g *ConfigManager) GetExcludePattern() string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return AppConfig.ExcludePattern
 }
 
 func (g *ConfigManager) SetThumbnailSize(thumbnailSize string) {
@@ -182,8 +243,43 @@ func (g *ConfigManager) AddCredentials(newAuthString string) error {
 	// If validation passed, add the new credentials
 	AppConfig.Credentials = append(AppConfig.Credentials, newAuthString)
 	AppConfig.Selected = email
-	saveAppConfig()
+	_ = saveAppConfig()
 	return nil
+}
+
+func (g *ConfigManager) CredentialNeedsTokenBinding(authString string) bool {
+	params, err := url.ParseQuery(authString)
+	if err != nil {
+		return false
+	}
+	return credentialNeedsTokenBinding(params)
+}
+
+func (g *ConfigManager) AddTokenBindingAliasFromADB(email string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return fmt.Errorf("email cannot be empty")
+	}
+
+	alias, err := extractTokenBindingAliasFromADB(email)
+	if err != nil {
+		return err
+	}
+
+	for i, cred := range AppConfig.Credentials {
+		params, err := url.ParseQuery(cred)
+		if err != nil {
+			continue
+		}
+		if params.Get("Email") != email {
+			continue
+		}
+		params.Set("token_binding_alias", alias)
+		AppConfig.Credentials[i] = params.Encode()
+		return saveAppConfig()
+	}
+
+	return fmt.Errorf("no credentials found for email %s", email)
 }
 
 func (g *ConfigManager) RemoveCredentials(email string) error {
@@ -221,8 +317,224 @@ func (g *ConfigManager) RemoveCredentials(email string) error {
 		AppConfig.Selected = ""
 	}
 
-	saveAppConfig()
+	_ = saveAppConfig()
 	return nil
+}
+
+func credentialNeedsTokenBinding(params url.Values) bool {
+	if params.Get("token_binding_alias") != "" {
+		return false
+	}
+	return params.Get("assertion_jwt") != "" ||
+		params.Get("check_tb_upgrade_eligible") != ""
+}
+
+// accountsCEDBPath is the credential-encrypted AccountManager database for the
+// primary (user 0) Android profile.
+const accountsCEDBPath = "/data/system_ce/0/accounts_ce.db"
+
+// errADBRootUnavailable signals that the device could not be read because root
+// access was denied, as opposed to the database simply not containing the key.
+var errADBRootUnavailable = errors.New("root access unavailable")
+
+func extractTokenBindingAliasFromADB(email string) (string, error) {
+	if _, err := exec.LookPath("adb"); err != nil {
+		return "", fmt.Errorf("adb was not found in PATH")
+	}
+
+	escapedEmail := strings.ReplaceAll(email, "'", "''")
+	query := fmt.Sprintf(
+		"select extras.value from extras join accounts on accounts._id=extras.accounts_id where accounts.name='%s' and extras.key='lstBindingKeyAlias';",
+		escapedEmail,
+	)
+
+	devices, err := listADBDevices()
+	if err != nil {
+		return "", err
+	}
+
+	var failures []string
+	var reachableRoot bool
+	for _, device := range devices {
+		_ = exec.Command("adb", "-s", device, "root").Run()
+
+		alias, rooted, err := readTokenBindingAliasFromDevice(device, query)
+		if rooted {
+			reachableRoot = true
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", device, cleanADBError(err.Error())))
+			continue
+		}
+
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			failures = append(failures, fmt.Sprintf("%s: no token binding key for %s", device, email))
+			continue
+		}
+		if !strings.HasPrefix(alias, tokenBindingECDSAAliasPrefix) {
+			failures = append(failures, fmt.Sprintf("%s: unsupported token binding key format", device))
+			continue
+		}
+
+		return alias, nil
+	}
+
+	if reachableRoot {
+		return "", fmt.Errorf("token binding alias not found for %s on any connected adb device (%s)", email, strings.Join(failures, "; "))
+	}
+	return "", fmt.Errorf("could not read Android AccountManager on any connected adb device; root is required (%s)", strings.Join(failures, "; "))
+}
+
+// readTokenBindingAliasFromDevice pulls the AccountManager database from a single
+// device and runs the lookup against the local copy. The pulled database is
+// sensitive (it holds auth material for every account on the device), so the
+// temporary copy is always removed via defer — including on a panic. The rooted
+// return reports whether the device was reachable with root, used to produce an
+// accurate error message.
+func readTokenBindingAliasFromDevice(device, query string) (alias string, rooted bool, err error) {
+	dbPath, cleanup, err := pullAccountsDB(device)
+	if err != nil {
+		// A non-root failure means we did reach the device with root but
+		// something else went wrong (e.g. the db file is missing).
+		return "", !errors.Is(err, errADBRootUnavailable), err
+	}
+	defer cleanup()
+
+	alias, err = queryTokenBindingAlias(dbPath, query)
+	if err != nil {
+		return "", true, err
+	}
+	return alias, true, nil
+}
+
+func listADBDevices() ([]string, error) {
+	out, err := exec.Command("adb", "devices").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list adb devices: %s", cleanADBError(string(out)))
+	}
+
+	var devices []string
+	var unavailable []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] == "List" {
+			continue
+		}
+		switch fields[1] {
+		case "device":
+			devices = append(devices, fields[0])
+		case "offline", "unauthorized", "no permissions":
+			unavailable = append(unavailable, fmt.Sprintf("%s is %s", fields[0], fields[1]))
+		default:
+			unavailable = append(unavailable, fmt.Sprintf("%s is %s", fields[0], fields[1]))
+		}
+	}
+
+	if len(devices) == 0 {
+		if len(unavailable) > 0 {
+			return nil, fmt.Errorf("no usable adb devices found (%s)", strings.Join(unavailable, "; "))
+		}
+		return nil, fmt.Errorf("no adb devices found")
+	}
+
+	return devices, nil
+}
+
+// pullAccountsDB streams the AccountManager database off the device via root and
+// writes it to a local temporary directory. Modern Android no longer ships the
+// sqlite3 binary, so the database is queried locally instead of on-device. The
+// returned cleanup function removes the temporary files.
+func pullAccountsDB(device string) (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "gotohp-adb-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	mainDest := filepath.Join(tmpDir, "accounts_ce.db")
+	if err := streamDeviceFile(device, accountsCEDBPath, mainDest); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+
+	// accounts_ce.db is typically in WAL mode; copy the companion files so the
+	// local query observes the latest writes. They may not exist, so ignore
+	// failures here.
+	_ = streamDeviceFile(device, accountsCEDBPath+"-wal", mainDest+"-wal")
+	_ = streamDeviceFile(device, accountsCEDBPath+"-shm", mainDest+"-shm")
+
+	return mainDest, cleanup, nil
+}
+
+// streamDeviceFile copies a single root-owned file off the device to localPath.
+// adb exec-out is used (rather than adb shell) to avoid the CRLF translation
+// that would corrupt the binary database.
+func streamDeviceFile(device, remotePath, localPath string) error {
+	cmd := exec.Command("adb", "-s", device, "exec-out", "su", "-c", fmt.Sprintf("cat %q", remotePath))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	// Some su builds exit 0 even when cat fails, so also treat stderr-with-no-
+	// output as a failure.
+	if runErr != nil || (stderr.Len() > 0 && stdout.Len() == 0) {
+		msg := cleanADBError(stderr.String())
+		if msg == "" && runErr != nil {
+			msg = runErr.Error()
+		}
+		if isADBRootFailure(msg) {
+			return fmt.Errorf("%w: %s", errADBRootUnavailable, msg)
+		}
+		return fmt.Errorf("failed to read %s: %s", remotePath, msg)
+	}
+
+	if err := os.WriteFile(localPath, stdout.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("failed to write local copy: %w", err)
+	}
+	return nil
+}
+
+// isADBRootFailure reports whether a device error indicates missing/denied root
+// rather than a missing file (which means root worked but the data is absent).
+func isADBRootFailure(msg string) bool {
+	m := strings.ToLower(msg)
+	if strings.Contains(m, "no such file") {
+		return false
+	}
+	return strings.Contains(m, "su:") ||
+		strings.Contains(m, "permission denied") ||
+		strings.Contains(m, "not allowed") ||
+		strings.Contains(m, "inaccessible or not found")
+}
+
+// queryTokenBindingAlias opens the pulled database locally with a pure-Go SQLite
+// driver and runs the lookup query. The local copy is private to this process,
+// so it is opened read-write to allow WAL recovery.
+func queryTokenBindingAlias(dbPath, query string) (string, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open accounts db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var alias string
+	if err := db.QueryRow(query).Scan(&alias); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to query token binding alias: %w", err)
+	}
+	return alias, nil
+}
+
+func cleanADBError(out string) string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "adb command failed"
+	}
+	return strings.Join(strings.Fields(out), " ")
 }
 
 func determineConfigPath() {
@@ -255,7 +567,7 @@ func getUserConfigDir() string {
 func (g *ConfigManager) GetConfig() Config {
 	// Don't reload if already loaded
 	if len(AppConfig.Credentials) == 0 && AppConfig.UploadThreads == 0 {
-		LoadConfig()
+		_ = LoadConfig()
 	}
 	return AppConfig
 }
@@ -282,15 +594,16 @@ func saveAppConfig() error {
 		fmt.Println(err)
 		return err
 	}
-	os.MkdirAll(filepath.Dir(ConfigPath), 0755)
+	if err := os.MkdirAll(filepath.Dir(ConfigPath), 0o755); err != nil {
+		return err
+	}
 	b, err := k.Marshal(yaml.Parser())
 	if err != nil {
 		fmt.Println(err)
 		return err
 	}
 
-	err = os.WriteFile(ConfigPath, b, 0644)
-
+	err = os.WriteFile(ConfigPath, b, 0o644)
 	if err != nil {
 		fmt.Println(err)
 		return err
@@ -301,7 +614,7 @@ func saveAppConfig() error {
 
 func loadAppConfig() Config {
 	var c Config
-	var k = koanf.New(".")
+	k := koanf.New(".")
 	if err := k.Load(file.Provider(ConfigPath), yaml.Parser()); err != nil {
 		log.Printf("error parsing app config: %v", err)
 		return DefaultConfig

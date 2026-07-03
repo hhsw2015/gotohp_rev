@@ -3,10 +3,13 @@
 package main
 
 import (
-	"app/backend"
 	"embed"
+	"fmt"
 	"log"
 	"os"
+	"strings"
+
+	"app/backend"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -30,6 +33,8 @@ func main() {
 }
 
 func runGUI() {
+	normalizeFrontendDevServerURL()
+
 	wailsApp := application.New(application.Options{
 		Name:        "com.xob0t.gotohp",
 		Description: "Google Photos unofficial client",
@@ -38,7 +43,7 @@ func runGUI() {
 			application.NewService(&backend.MediaBrowser{}),
 		},
 		Assets: application.AssetOptions{
-			Handler: application.AssetFileServerFS(assets),
+			Handler: application.BundledAssetFileServer(assets),
 		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
@@ -46,15 +51,14 @@ func runGUI() {
 	})
 
 	window := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:             title,
-		Frameless:         false,
-		Width:             800,
-		Height:            600,
-		MaxWidth:          0,
-		MaxHeight:         0,
-		EnableDragAndDrop: true,
-		DisableResize:     false,
-		BackgroundType:    application.BackgroundTypeTranslucent,
+		Title:               title,
+		Frameless:           false,
+		Width:               800,
+		Height:              600,
+		EnableFileDrop:      true,
+		DisableResize:       false,
+		MaximiseButtonState: application.ButtonDisabled,
+		BackgroundType:      application.BackgroundTypeTranslucent,
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 0,
 			Backdrop:                application.MacBackdropTranslucent,
@@ -72,13 +76,48 @@ func runGUI() {
 		uploadManager.Cancel()
 	})
 
-	window.OnWindowEvent(events.Common.WindowDropZoneFilesDropped, func(event *application.WindowEvent) {
+	window.OnWindowEvent(events.Common.WindowFilesDropped, func(event *application.WindowEvent) {
 		paths := event.Context().DroppedFiles()
-		uploadManager.Upload(app, paths)
+		dropTarget := event.Context().DropTargetDetails()
+
+		var dropZone string
+		if dropTarget != nil {
+			dropZone = dropTarget.Attributes["data-drop-zone"]
+			wailsApp.Logger.Info("Drop target detected",
+				"dropZone", dropZone,
+				"elementID", dropTarget.ElementID)
+		}
+
+		// Emit event to frontend with drop details
+		wailsApp.Event.Emit("files-dropped", backend.FilesDroppedEvent{
+			Files:    paths,
+			DropZone: dropZone,
+		})
+	})
+
+	// Listen for upload request from frontend (after drop zone is determined)
+	wailsApp.Event.On("startUpload", func(e *application.CustomEvent) {
+		if data, ok := e.Data.(backend.StartUploadEvent); ok {
+			wailsApp.Logger.Info("Starting upload", "fileCount", len(data.Files))
+			uploadManager.Upload(app, data.Files)
+		} else {
+			wailsApp.Logger.Error("startUpload: unexpected data type", "type", fmt.Sprintf("%T", e.Data))
+		}
 	})
 
 	err := wailsApp.Run()
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+func normalizeFrontendDevServerURL() {
+	const envName = "FRONTEND_DEVSERVER_URL"
+
+	value := os.Getenv(envName)
+	value = strings.Replace(value, "http://localhost:", "http://127.0.0.1:", 1)
+	value = strings.Replace(value, "https://localhost:", "https://127.0.0.1:", 1)
+	if value != os.Getenv(envName) {
+		_ = os.Setenv(envName, value)
 	}
 }

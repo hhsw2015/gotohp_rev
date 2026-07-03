@@ -30,6 +30,7 @@ interface Settings {
     forceUpload: boolean
     deleteFromHost: boolean
     disableUnsupportedFilesFilter: boolean
+    setDateFromFilename: boolean
     uploadThreads: number
     thumbnailSize: string
     updateCheckIntervalSeconds: number
@@ -45,6 +46,7 @@ const settings = ref<Settings>({
     forceUpload: false,
     deleteFromHost: false,
     disableUnsupportedFilesFilter: false,
+    setDateFromFilename: false,
     uploadThreads: 0,
     thumbnailSize: 'medium',
     updateCheckIntervalSeconds: 0,
@@ -62,6 +64,7 @@ onMounted(async () => {
         forceUpload: config.forceUpload || false,
         deleteFromHost: config.deleteFromHost || false,
         disableUnsupportedFilesFilter: config.disableUnsupportedFilesFilter || false,
+        setDateFromFilename: config.setDateFromFilename || false,
         uploadThreads: config.uploadThreads || 1,
         thumbnailSize: config.thumbnailSize || 'medium',
         updateCheckIntervalSeconds: config.updateCheckIntervalSeconds || 0,
@@ -98,6 +101,10 @@ watch(() => settings.value.deleteFromHost, async (newValue) => {
 
 watch(() => settings.value.disableUnsupportedFilesFilter, async (newValue) => {
     await ConfigManager.SetDisableUnsupportedFilesFilter(newValue)
+})
+
+watch(() => settings.value.setDateFromFilename, async (newValue) => {
+    await ConfigManager.SetSetDateFromFilename(newValue)
 })
 
 watch(() => settings.value.uploadThreads, async (newValue) => {
@@ -193,6 +200,10 @@ function secondsToInt(value: number): number {
             <Switch id="filter-unsupported" v-model="settings.disableUnsupportedFilesFilter" />
         </div>
         <div class="flex items-center justify-between">
+            <Label for="set-date-from-filename" class="size-full cursor-pointer">从文件名读取上传日期</Label>
+            <Switch id="set-date-from-filename" v-model="settings.setDateFromFilename" />
+        </div>
+        <div class="flex items-center justify-between">
             <Label for="delete-host" class="size-full cursor-pointer">上传后删除本地文件</Label>
             <Switch id="delete-host" variant="destructive" v-model="settings.deleteFromHost" />
         </div>
@@ -216,5 +227,4 @@ function secondsToInt(value: number): number {
             <Input v-model="settings.proxy" type="text" placeholder="代理地址（可选）" />
         </div>
     </div>
-
 </template>
