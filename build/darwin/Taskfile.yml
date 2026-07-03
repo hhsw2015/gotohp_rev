@@ -77,7 +77,8 @@ tasks:
     deps:
       - task: build
         vars:
-          PRODUCTION: "true"
+          PRODUCTION: '{{.PRODUCTION | default "true"}}'
+          ARCH: '{{.ARCH | default ARCH}}'
     cmds:
       - task: create:app:bundle
 
