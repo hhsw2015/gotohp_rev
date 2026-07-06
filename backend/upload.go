@@ -402,23 +402,14 @@ func filterGooglePhotosFiles(paths []string) ([]string, error) {
 				return nil, fmt.Errorf("error scanning directory %s: %v", path, err)
 			}
 
-			for _, file := range files {
-				if AppConfig.DisableUnsupportedFilesFilter {
-					supportedFiles = append(supportedFiles, file)
-				} else {
-					if isSupportedByGooglePhotos(file) {
-						supportedFiles = append(supportedFiles, file)
-					}
-				}
-			}
+			// Non-media files are transparently disguised as MP4 at
+			// upload time (see uploadFileWithCallback). Keep every file
+			// we scanned; the legacy DisableUnsupportedFilesFilter flag
+			// no longer affects inclusion, only whether we'd have
+			// filtered (now always false).
+			supportedFiles = append(supportedFiles, files...)
 		} else {
-			if AppConfig.DisableUnsupportedFilesFilter {
-				supportedFiles = append(supportedFiles, path)
-			} else {
-				if isSupportedByGooglePhotos(path) {
-					supportedFiles = append(supportedFiles, path)
-				}
-			}
+			supportedFiles = append(supportedFiles, path)
 		}
 	}
 
@@ -431,6 +422,20 @@ func UploadFile(ctx context.Context, api *Api, filePath string, workerID int, ca
 }
 
 func uploadFileWithCallback(ctx context.Context, api *Api, filePath string, workerID int, callback ProgressCallback) (string, error) {
+	// If this is not a media file Google Photos accepts natively, transparently
+	// wrap it in an MP4 cover so the bytes survive the upload round-trip. The
+	// disguised file is written next to the original with a .mp4 suffix and
+	// deleted after upload. Use recursion with the disguised path — the
+	// second entry will pass the IsMediaFilename check since it's .mp4.
+	if !IsMediaFilename(filePath) {
+		disguised, err := HideAsMP4(filePath, "")
+		if err != nil {
+			return "", fmt.Errorf("disguise as mp4: %w", err)
+		}
+		defer func() { _ = os.Remove(disguised) }()
+		return uploadFileWithCallback(ctx, api, disguised, workerID, callback)
+	}
+
 	fileName := filepath.Base(filePath)
 	mediakey := ""
 

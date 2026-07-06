@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"app/backend"
@@ -471,6 +472,19 @@ func runCLIDownload(mediaKey, outputPath string, original bool) error {
 	err = api.DownloadFile(downloadURL, outputPath)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
+	}
+
+	// If this download is a gotohp-disguised container (arbitrary bytes hidden
+	// inside an MP4 cover), transparently unwrap it back to the original file.
+	restored, ok, extractErr := backend.TryExtractDisguised(outputPath, filepath.Dir(outputPath))
+	if extractErr != nil {
+		fmt.Printf("Warning: disguise-extract check failed: %v\n", extractErr)
+	} else if ok {
+		if err := os.Remove(outputPath); err != nil {
+			fmt.Printf("Warning: could not remove disguised container %s: %v\n", outputPath, err)
+		}
+		fmt.Printf("✓ Downloaded (unwrapped from MP4 cover): %s\n", restored)
+		return nil
 	}
 
 	fmt.Printf("✓ Downloaded successfully: %s\n", outputPath)
