@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"embed"
 	"fmt"
 	"os"
@@ -39,6 +40,10 @@ func isCLICommand(arg string) bool {
 		"albums", // List albums
 		"autowash", // Start auto-wash service
 		"credentials", "creds", // Support both full and short form
+		"login",                // One-shot oauth_token -> credentials
+		"trash",                // Soft-delete by dedupKey
+		"delete", "purge",      // Hard-delete by dedupKey
+		"empty-trash", "empty", // Purge all items currently in trash
 		"help", "--help", "-h",
 		"version", "--version", "-v",
 	}
@@ -168,12 +173,10 @@ func runCLI() {
 			}
 		}
 
-		// Set custom config path if provided
 		if configPath != "" {
 			backend.ConfigPath = configPath
 		}
 
-		// Run download
 		err := runCLIDownload(mediaKey, outputPath, original)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
@@ -243,12 +246,10 @@ func runCLI() {
 			}
 		}
 
-		// Set custom config path if provided
 		if configPath != "" {
 			backend.ConfigPath = configPath
 		}
 
-		// Run thumbnail download
 		err := runCLIThumbnail(mediaKey, outputPath, width, height, size, noOverlay, forceJPEG)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Thumbnail download failed: %v\n", err)
@@ -481,6 +482,146 @@ func runCLI() {
 			os.Exit(1)
 		}
 
+	case "login":
+		if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") {
+			printLoginHelp()
+			return
+		}
+		configPath := ""
+		tokenFile := ""
+		fromStdin := false
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--config" || arg == "-c":
+				if i+1 >= len(os.Args) {
+					fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", arg)
+					os.Exit(1)
+				}
+				configPath = os.Args[i+1]
+				i++
+			case arg == "--token-file":
+				if i+1 >= len(os.Args) {
+					fmt.Fprintf(os.Stderr, "Error: --token-file requires a path\n")
+					os.Exit(1)
+				}
+				tokenFile = os.Args[i+1]
+				i++
+			case arg == "--stdin" || arg == "-":
+				fromStdin = true
+			case strings.HasPrefix(arg, "-"):
+				fmt.Fprintf(os.Stderr, "Error: unknown flag '%s'\n", arg)
+				printLoginHelp()
+				os.Exit(1)
+			default:
+				fmt.Fprintf(os.Stderr, "Error: unexpected positional argument %q\n", arg)
+				fmt.Fprintln(os.Stderr, "The oauth_token must NOT be passed on the command line")
+				fmt.Fprintln(os.Stderr, "(it would leak into shell history and process listings).")
+				printLoginHelp()
+				os.Exit(1)
+			}
+		}
+		if configPath != "" {
+			backend.ConfigPath = configPath
+		}
+		if err := backend.LoadConfig(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+			os.Exit(1)
+		}
+		oauthToken, err := readOAuthToken(tokenFile, fromStdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Could not read oauth_token: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runCLILogin(oauthToken); err != nil {
+			fmt.Fprintf(os.Stderr, "Login failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "empty-trash", "empty":
+		if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") {
+			printEmptyTrashHelp()
+			return
+		}
+		configPath := ""
+		yes := false
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch arg {
+			case "--config", "-c":
+				if i+1 >= len(os.Args) {
+					fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", arg)
+					os.Exit(1)
+				}
+				configPath = os.Args[i+1]
+				i++
+			case "--yes", "-y":
+				yes = true
+			default:
+				fmt.Fprintf(os.Stderr, "Error: unknown argument '%s'\n", arg)
+				printEmptyTrashHelp()
+				os.Exit(1)
+			}
+		}
+		if configPath != "" {
+			backend.ConfigPath = configPath
+		}
+		if err := backend.LoadConfig(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runCLIEmptyTrash(yes); err != nil {
+			fmt.Fprintf(os.Stderr, "Empty-trash failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "trash", "delete", "purge":
+		hard := command == "delete" || command == "purge"
+		if len(os.Args) > 2 && (os.Args[2] == "--help" || os.Args[2] == "-h") {
+			printDeleteHelp(hard)
+			return
+		}
+		if len(os.Args) < 3 {
+			fmt.Println("Error: mediaKey(s) required")
+			printDeleteHelp(hard)
+			os.Exit(1)
+		}
+		var mediaKeys []string
+		configPath := ""
+		for i := 2; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "--config" || arg == "-c":
+				if i+1 >= len(os.Args) {
+					fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", arg)
+					os.Exit(1)
+				}
+				configPath = os.Args[i+1]
+				i++
+			case strings.HasPrefix(arg, "-"):
+				fmt.Fprintf(os.Stderr, "Error: unknown flag '%s'\n", arg)
+				printDeleteHelp(hard)
+				os.Exit(1)
+			default:
+				mediaKeys = append(mediaKeys, arg)
+			}
+		}
+		if len(mediaKeys) == 0 {
+			fmt.Println("Error: at least one mediaKey required")
+			os.Exit(1)
+		}
+		if configPath != "" {
+			backend.ConfigPath = configPath
+		}
+		if err := backend.LoadConfig(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runCLIDelete(mediaKeys, hard); err != nil {
+			fmt.Fprintf(os.Stderr, "Delete failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "credentials", "creds":
 		if len(os.Args) < 3 {
 			fmt.Println("Error: subcommand required")
@@ -539,6 +680,10 @@ func printCLIHelp() {
 	fmt.Printf("  %s          List your albums\n", commandStyle.Render("albums"))
 	fmt.Println()
 	fmt.Println("Advanced Commands:")
+	fmt.Printf("  %s          Add a credential from a browser oauth_token (zero ADB)\n", commandStyle.Render("login"))
+	fmt.Printf("  %s          Move media to trash by mediaKey\n", commandStyle.Render("trash"))
+	fmt.Printf("  %s         Permanently delete media by mediaKey\n", commandStyle.Render("delete"))
+	fmt.Printf("  %s    Permanently delete every item currently in trash\n", commandStyle.Render("empty-trash"))
 	fmt.Printf("  %s       Manage Google Photos credentials/accounts\n", commandStyle.Render("creds"))
 	fmt.Printf("  %s       Start auto-sync and backup service\n", commandStyle.Render("autowash"))
 	fmt.Printf("  %s   Download a thumbnail (various sizes available)\n", commandStyle.Render("thumbnail"))
@@ -606,7 +751,8 @@ func printAutoWashHelp() {
 func printDownloadHelp() {
 	fmt.Printf("Usage: %s %s %s %s\n", commandStyle.Render(cliExecutableName), commandStyle.Render("download"), argStyle.Render("<media-key>"), flagStyle.Render("[flags]"))
 	fmt.Println()
-	fmt.Println("Download a file from Google Photos using its media key.")
+	fmt.Println("Download a file from Google Photos by mediaKey.")
+	fmt.Println("Use 'gotohp list -j' to see mediaKeys for items in your library.")
 	fmt.Println()
 	fmt.Println("Flags:")
 	printFlag("-o", "--output", "<path>", "Output file path (default: original filename)")
@@ -825,4 +971,368 @@ func handleCredentialsCommand(args []string) {
 		printCredentialsHelp()
 		os.Exit(1)
 	}
+}
+
+// runCLILogin turns an oauth_token cookie from an EmbeddedSetup browser login
+// into a stored credential. No Android device involved.
+func runCLILogin(oauthToken string) error {
+	androidID, err := backend.RandomAndroidID()
+	if err != nil {
+		return fmt.Errorf("androidId gen: %w", err)
+	}
+	fmt.Println("Exchanging oauth_token for master token...")
+	email, master, err := backend.ExchangeOAuthToken(oauthToken, androidID)
+	if err != nil {
+		return err
+	}
+	authString := backend.BuildAuthStringFromMasterToken(email, master, androidID)
+
+	cm := &backend.ConfigManager{}
+	previouslySelected := strings.TrimSpace(backend.AppConfig.Selected)
+	if err := cm.AddCredentials(authString); err != nil {
+		return fmt.Errorf("save credential: %w", err)
+	}
+	// If there was no active account yet, select the new one automatically.
+	// Otherwise leave the existing selection alone and tell the user, so that
+	// adding a second account never silently redirects subsequent commands to
+	// the wrong mailbox.
+	if previouslySelected == "" {
+		cm.SetSelected(email)
+	}
+	fmt.Printf("✓ Logged in as %s\n", email)
+	active := strings.TrimSpace(backend.AppConfig.Selected)
+	if active == "" {
+		active = email
+	}
+	if active != email {
+		fmt.Printf("  Active account is still %s\n", active)
+		fmt.Printf("  Switch with: %s creds set %s\n", cliExecutableName, email)
+	} else {
+		fmt.Printf("  Active account: %s\n", active)
+	}
+	// Deliberately NOT printing master token or androidId.
+	return nil
+}
+
+// readOAuthToken pulls the oauth_token from one of three sources, in priority:
+//   1. --token-file <path>      (recommended; not visible in `ps`)
+//   2. env GOTOHP_OAUTH_TOKEN   (script-friendly)
+//   3. stdin                    (interactive default; also --stdin/-)
+// A CLI positional argument is intentionally NOT accepted: it would leak into
+// shell history, /proc/<pid>/cmdline, and `ps` output.
+func readOAuthToken(file string, stdin bool) (string, error) {
+	if file != "" {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", file, err)
+		}
+		tok := strings.TrimSpace(string(b))
+		if tok == "" {
+			return "", fmt.Errorf("token file is empty")
+		}
+		return tok, nil
+	}
+	if tok := strings.TrimSpace(os.Getenv("GOTOHP_OAUTH_TOKEN")); tok != "" {
+		return tok, nil
+	}
+	if !stdin {
+		fmt.Fprintln(os.Stderr, "Paste the oauth_token cookie value and press Enter.")
+		fmt.Fprintln(os.Stderr, "(Or re-run with --token-file <path> or GOTOHP_OAUTH_TOKEN env var.)")
+		fmt.Fprint(os.Stderr, "oauth_token: ")
+	}
+	// Use a bufio.Scanner with an enlarged buffer so tokens containing
+	// unusual characters or unusual length are not silently truncated (as
+	// fmt.Fscanln would). Read exactly one line, verbatim.
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("read stdin: %w", err)
+		}
+		return "", fmt.Errorf("no token provided")
+	}
+	line := strings.TrimSpace(scanner.Text())
+	if line == "" {
+		return "", fmt.Errorf("empty token")
+	}
+	return line, nil
+}
+
+// runCLIDelete accepts mediaKeys from the user, resolves each to its
+// server-authoritative dedupKey, then trashes or permanently deletes. Batches
+// of >100 are chunked to stay under any server-side request-size limit.
+func runCLIDelete(mediaKeys []string, hard bool) error {
+	if len(mediaKeys) == 0 {
+		return fmt.Errorf("nothing to delete")
+	}
+	fmt.Printf("Resolving %d mediaKey(s) → dedupKeys via GetMediaInfo...\n", len(mediaKeys))
+	pairs, err := resolveDedupKeysFromMediaKeys(mediaKeys)
+	if err != nil {
+		return err
+	}
+	if len(pairs) == 0 {
+		return fmt.Errorf("no valid dedup keys resolved")
+	}
+	dedupKeys := make([]string, len(pairs))
+	for i, p := range pairs {
+		dedupKeys[i] = p.DedupKey
+	}
+	api, err := backend.NewApi()
+	if err != nil {
+		return err
+	}
+	const chunk = 100
+	trashInBatches := func(action string, fn func([]string) error) error {
+		for i := 0; i < len(dedupKeys); i += chunk {
+			end := i + chunk
+			if end > len(dedupKeys) {
+				end = len(dedupKeys)
+			}
+			batch := dedupKeys[i:end]
+			if err := fn(batch); err != nil {
+				return fmt.Errorf("%s batch %d-%d: %w", action, i, end, err)
+			}
+			if len(dedupKeys) > chunk {
+				fmt.Printf("  %s %d / %d\n", action, end, len(dedupKeys))
+			}
+		}
+		return nil
+	}
+	if hard {
+		fmt.Printf("Moving %d item(s) to trash first...\n", len(dedupKeys))
+		if err := trashInBatches("trash", api.MoveToTrash); err != nil {
+			return err
+		}
+		fmt.Println("Permanently deleting...")
+		if err := trashInBatches("purge", api.PermanentlyDelete); err != nil {
+			return fmt.Errorf("permanent delete (items are still in trash): %w", err)
+		}
+	} else {
+		fmt.Printf("Moving %d item(s) to trash...\n", len(dedupKeys))
+		if err := trashInBatches("trash", api.MoveToTrash); err != nil {
+			return err
+		}
+	}
+	action := "trashed"
+	if hard {
+		action = "permanently deleted"
+	}
+	fmt.Printf("✓ %d item(s) %s\n", len(pairs), action)
+	for _, p := range pairs {
+		fmt.Printf("  - %s\n", p.MediaKey)
+	}
+	return nil
+}
+
+// resolvedKey pairs the mediaKey the user supplied with the server-authoritative
+// dedupKey required by MoveToTrash / PermanentlyDelete.
+type resolvedKey struct {
+	MediaKey string
+	DedupKey string
+}
+
+// resolveDedupKeysFromMediaKeys converts a list of mediaKeys into
+// (mediaKey, dedupKey) pairs via GetMediaInfo. This is the only sound way to
+// feed the destructive endpoints without trusting local assumptions about how
+// Google derives dedupKey from file bytes. Empty and duplicate inputs are
+// dropped; the returned slice reflects exactly what will be operated on.
+func resolveDedupKeysFromMediaKeys(mediaKeys []string) ([]resolvedKey, error) {
+	api, err := backend.NewApi()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]resolvedKey, 0, len(mediaKeys))
+	seen := map[string]struct{}{}
+	for _, mk := range mediaKeys {
+		mk = strings.TrimSpace(mk)
+		if mk == "" {
+			continue
+		}
+		if _, dup := seen[mk]; dup {
+			continue
+		}
+		seen[mk] = struct{}{}
+		info, err := api.GetMediaInfo(mk)
+		if err != nil {
+			return nil, fmt.Errorf("resolve mediaKey %s: %w", mk, err)
+		}
+		if info == nil || info.DedupKey == "" {
+			return nil, fmt.Errorf("mediaKey %s has no dedup key in server response", mk)
+		}
+		out = append(out, resolvedKey{MediaKey: mk, DedupKey: info.DedupKey})
+	}
+	return out, nil
+}
+
+func printLoginHelp() {
+	fmt.Printf("Usage: %s %s %s\n",
+		commandStyle.Render(cliExecutableName),
+		commandStyle.Render("login"),
+		flagStyle.Render("[flags]"))
+	fmt.Println()
+	fmt.Println("Add a Google Photos credential without an Android device.")
+	fmt.Println()
+	fmt.Println("Steps:")
+	fmt.Println("  1. In a private/incognito browser window, open:")
+	fmt.Println("       https://accounts.google.com/EmbeddedSetup")
+	fmt.Println("  2. Sign in normally (2FA / passkey all supported).")
+	fmt.Println("  3. After sign-in completes, open DevTools:")
+	fmt.Println("       Application → Cookies → https://accounts.google.com")
+	fmt.Println("     Copy the value of the cookie named 'oauth_token'.")
+	fmt.Println("  4. Provide it via one of (in priority order):")
+	fmt.Printf("       %s login --token-file /path/to/token.txt\n", cliExecutableName)
+	fmt.Printf("       GOTOHP_OAUTH_TOKEN=oauth2_4/... %s login\n", cliExecutableName)
+	fmt.Printf("       %s login          (prompts on stdin)\n", cliExecutableName)
+	fmt.Println()
+	fmt.Println("The token is NEVER accepted as a command-line argument to")
+	fmt.Println("prevent it leaking into shell history and `ps` output.")
+	fmt.Println()
+	fmt.Println("Flags:")
+	printFlag("", "--token-file", "<path>", "Read oauth_token from this file")
+	printFlag("", "--stdin", "", "Read oauth_token from stdin (default when nothing else set)")
+	printFlag("-c", "--config", "<path>", "Path to config file")
+}
+
+func printDeleteHelp(hard bool) {
+	verb := "trash"
+	desc := "Move media items to trash (soft delete, recoverable within 60 days)."
+	if hard {
+		verb = "delete"
+		desc = "Permanently delete media items from Google Photos. This cannot be undone."
+	}
+	fmt.Printf("Usage: %s %s %s %s\n",
+		commandStyle.Render(cliExecutableName),
+		commandStyle.Render(verb),
+		argStyle.Render("<media-key>..."),
+		flagStyle.Render("[flags]"))
+	fmt.Println()
+	fmt.Println(desc)
+	fmt.Println()
+	fmt.Println("Arguments must be mediaKeys (from 'gotohp list -j' output).")
+	fmt.Println("The dedup key required by the server is resolved automatically")
+	fmt.Println("via GetMediaInfo, so you never touch it directly.")
+	fmt.Println()
+	fmt.Println("Flags:")
+	printFlag("-c", "--config", "<path>", "Path to config file")
+}
+
+// runCLIEmptyTrash pulls every trashed item via list, then hard-deletes them
+// by dedup key. Prompts for confirmation unless --yes is set.
+//
+// NOTE: This temporarily flips the process-global
+// backend.AppConfig.RequestTrashItems flag so that the list request includes
+// trashed items regardless of the user's persisted setting. That flag is
+// unfortunately read (unlocked) inside the protobuf request builder in
+// backend/api.go, so plumbing a per-call override would touch the whole
+// media-list request stack. In the CLI runtime this is safe: the command runs
+// synchronously with no other goroutines touching the flag. If we ever call
+// this from a context where a background scan can race, the flag needs to
+// become a per-request parameter instead.
+func runCLIEmptyTrash(assumeYes bool) error {
+	prev := backend.AppConfig.RequestTrashItems
+	backend.AppConfig.RequestTrashItems = true
+	defer func() { backend.AppConfig.RequestTrashItems = prev }()
+
+	mb := &backend.MediaBrowser{}
+	seen := map[string]struct{}{}
+	var dedupKeys []string
+	pageToken := ""
+	scanned := 0
+
+	fmt.Println("Scanning library for trashed items...")
+	// Terminate strictly on empty NextPageToken. No streak heuristic: on large
+	// libraries with sparsely-interleaved trashed items an early-stop can miss
+	// tail matches, and we are about to permanently delete.
+	//
+	// Safety rails: hard iteration cap so a buggy server returning a
+	// non-advancing NextPageToken cannot spin forever, and detect a stuck
+	// token (identical page returned twice) since we are one call away from
+	// a destructive operation.
+	const maxPages = 2000
+	prevToken := ""
+	for iter := 0; iter < maxPages; iter++ {
+		res, err := mb.GetMediaList(pageToken, "", 0, 500)
+		if err != nil {
+			return fmt.Errorf("list: %w", err)
+		}
+		if res == nil {
+			return fmt.Errorf("list: unexpected nil result")
+		}
+		scanned += len(res.Items)
+		for _, it := range res.Items {
+			if !it.IsTrash || it.DedupKey == "" {
+				continue
+			}
+			if _, ok := seen[it.DedupKey]; ok {
+				continue
+			}
+			seen[it.DedupKey] = struct{}{}
+			dedupKeys = append(dedupKeys, it.DedupKey)
+		}
+		if res.NextPageToken == "" {
+			break
+		}
+		if res.NextPageToken == prevToken {
+			return fmt.Errorf("pagination stalled: server returned the same NextPageToken twice; aborting to avoid a partial trash purge")
+		}
+		prevToken = pageToken
+		pageToken = res.NextPageToken
+		if iter == maxPages-1 {
+			return fmt.Errorf("pagination exceeded %d iterations without terminating; aborting", maxPages)
+		}
+	}
+	fmt.Printf("Scanned %d items total.\n", scanned)
+
+	if len(dedupKeys) == 0 {
+		fmt.Println("Trash is already empty.")
+		return nil
+	}
+	fmt.Printf("Found %d item(s) in trash.\n", len(dedupKeys))
+
+	if !assumeYes {
+		fmt.Print("Permanently delete all of them? This CANNOT be undone. [y/N]: ")
+		var answer string
+		_, _ = fmt.Scanln(&answer)
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Println("Aborted.")
+			return nil
+		}
+	}
+
+	api, err := backend.NewApi()
+	if err != nil {
+		return err
+	}
+	// Chunk deletes: the endpoint accepts hundreds per call but stay conservative.
+	const chunk = 100
+	deleted := 0
+	for i := 0; i < len(dedupKeys); i += chunk {
+		end := i + chunk
+		if end > len(dedupKeys) {
+			end = len(dedupKeys)
+		}
+		batch := dedupKeys[i:end]
+		if err := api.PermanentlyDelete(batch); err != nil {
+			return fmt.Errorf("permanently delete (batch %d-%d): %w", i, end, err)
+		}
+		deleted += len(batch)
+		fmt.Printf("  purged %d / %d\n", deleted, len(dedupKeys))
+	}
+	fmt.Printf("✓ Trash emptied: %d item(s) permanently deleted.\n", deleted)
+	return nil
+}
+
+func printEmptyTrashHelp() {
+	fmt.Printf("Usage: %s %s %s\n",
+		commandStyle.Render(cliExecutableName),
+		commandStyle.Render("empty-trash"),
+		flagStyle.Render("[flags]"))
+	fmt.Println()
+	fmt.Println("Scans the library for items already in trash and permanently deletes")
+	fmt.Println("all of them. This CANNOT be undone.")
+	fmt.Println()
+	fmt.Println("Flags:")
+	printFlag("-y", "--yes", "", "Skip confirmation prompt")
+	printFlag("-c", "--config", "<path>", "Path to config file")
 }
