@@ -476,12 +476,19 @@ func runCLIDownload(mediaKey, outputPath string, original bool) error {
 
 	// If this download is a gotohp-disguised container (arbitrary bytes hidden
 	// inside an MP4 cover), transparently unwrap it back to the original file.
+	// The extractor writes into the same directory using the embedded name
+	// (or `name-1.ext`, `name-2.ext`, ... on collision), then we delete the
+	// downloaded MP4 unless it happens to be the restored file itself.
 	restored, ok, extractErr := backend.TryExtractDisguised(outputPath, filepath.Dir(outputPath))
 	if extractErr != nil {
 		fmt.Printf("Warning: disguise-extract check failed: %v\n", extractErr)
 	} else if ok {
-		if err := os.Remove(outputPath); err != nil {
-			fmt.Printf("Warning: could not remove disguised container %s: %v\n", outputPath, err)
+		absOut, _ := filepath.Abs(outputPath)
+		absRestored, _ := filepath.Abs(restored)
+		if absOut != absRestored {
+			if err := os.Remove(outputPath); err != nil {
+				fmt.Printf("Warning: could not remove disguised container %s: %v\n", outputPath, err)
+			}
 		}
 		fmt.Printf("✓ Downloaded (unwrapped from MP4 cover): %s\n", restored)
 		return nil

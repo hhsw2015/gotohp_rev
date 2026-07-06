@@ -401,14 +401,21 @@ func filterGooglePhotosFiles(paths []string) ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("error scanning directory %s: %v", path, err)
 			}
-
-			// Non-media files are transparently disguised as MP4 at
-			// upload time (see uploadFileWithCallback). Keep every file
-			// we scanned; the legacy DisableUnsupportedFilesFilter flag
-			// no longer affects inclusion, only whether we'd have
-			// filtered (now always false).
-			supportedFiles = append(supportedFiles, files...)
+			// DisableUnsupportedFilesFilter now doubles as "opt in to MP4
+			// disguising for non-media files". When it's false (default),
+			// directory scans skip non-media exactly like they did before,
+			// so pointing gotohp at Downloads/ won't quietly upload every
+			// .DS_Store, .env, etc. When it's true, non-media files come
+			// through and uploadFileWithCallback will wrap them in an MP4
+			// cover.
+			for _, file := range files {
+				if AppConfig.DisableUnsupportedFilesFilter || isSupportedByGooglePhotos(file) {
+					supportedFiles = append(supportedFiles, file)
+				}
+			}
 		} else {
+			// Explicit single-file argument is always uploaded (users know
+			// what they typed). If it's not media, upload will disguise it.
 			supportedFiles = append(supportedFiles, path)
 		}
 	}
@@ -423,17 +430,54 @@ func UploadFile(ctx context.Context, api *Api, filePath string, workerID int, ca
 
 func uploadFileWithCallback(ctx context.Context, api *Api, filePath string, workerID int, callback ProgressCallback) (string, error) {
 	// If this is not a media file Google Photos accepts natively, transparently
-	// wrap it in an MP4 cover so the bytes survive the upload round-trip. The
-	// disguised file is written next to the original with a .mp4 suffix and
-	// deleted after upload. Use recursion with the disguised path — the
-	// second entry will pass the IsMediaFilename check since it's .mp4.
+	// wrap it in an MP4 cover so the bytes survive the upload round-trip. We
+	// materialize the disguised copy in os.TempDir (never next to the source,
+	// so we can't clobber a user's foo.zip.mp4) and mirror the original file's
+	// mtime onto the wrapped file so the upload timestamp is stable.
+	//
+	// The recursive call receives a synthetic path/name pair: the on-disk
+	// path is the temp .mp4 (needed for hashing/upload I/O), but everything
+	// user-visible (progress events, DeleteFromHost target) keeps referring
+	// to the original file via cleanup wired here.
 	if !IsMediaFilename(filePath) {
-		disguised, err := HideAsMP4(filePath, "")
+		origInfo, err := os.Stat(filePath)
+		if err != nil {
+			return "", fmt.Errorf("stat original: %w", err)
+		}
+		// Materialize into a temp file whose leaf name is the original file's
+		// name plus `.mp4`. That way the artifact Google sees is `foo.zip.mp4`
+		// (not a random `gotohp-disguise-*` scratchpad name), and downstream
+		// filename-based lookup keeps working.
+		disguisedDir, err := os.MkdirTemp("", "gotohp-disguise-*")
+		if err != nil {
+			return "", fmt.Errorf("mkdir temp: %w", err)
+		}
+		defer func() { _ = os.RemoveAll(disguisedDir) }()
+		disguised, err := HideAsMP4(filePath, filepath.Join(disguisedDir, filepath.Base(filePath)+".mp4"))
 		if err != nil {
 			return "", fmt.Errorf("disguise as mp4: %w", err)
 		}
-		defer func() { _ = os.Remove(disguised) }()
-		return uploadFileWithCallback(ctx, api, disguised, workerID, callback)
+		// Preserve mtime so the upload timestamp reflects the original file,
+		// not the moment we produced the wrapper.
+		_ = os.Chtimes(disguised, origInfo.ModTime(), origInfo.ModTime())
+
+		// Recurse without DeleteFromHost, so the inner call doesn't try to
+		// delete the disguised temp (we own that lifecycle). We restore
+		// AppConfig on the way out.
+		prevDelete := AppConfig.DeleteFromHost
+		AppConfig.DeleteFromHost = false
+		mediaKey, uerr := uploadFileWithCallback(ctx, api, disguised, workerID, callback)
+		AppConfig.DeleteFromHost = prevDelete
+		_ = os.Remove(disguised)
+		if uerr != nil {
+			return "", uerr
+		}
+		if AppConfig.DeleteFromHost {
+			if rmErr := os.Remove(filePath); rmErr != nil {
+				return mediaKey, fmt.Errorf("uploaded ok but failed to delete original %s: %w", filePath, rmErr)
+			}
+		}
+		return mediaKey, nil
 	}
 
 	fileName := filepath.Base(filePath)

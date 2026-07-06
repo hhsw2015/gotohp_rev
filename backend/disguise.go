@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Google Photos "original quality" storage does not re-encode uploads, so a
@@ -29,6 +30,17 @@ const (
 
 	// disguiseSuffix is the extension appended when disguising an input.
 	disguiseSuffix = ".mp4"
+
+	// disguiseMaxNameLen bounds the embedded filename length to defend
+	// against a garbage trailer whose "length" field is random.
+	disguiseMaxNameLen = 4096
+
+	// disguiseTailSearchWindow is how much we scan from the end of the
+	// file when looking for the trailer. The trailer sits right after the
+	// MP4 cover, so a payload of any size still keeps the magic near the
+	// front, but we defensively look both ends via seek so we can bail
+	// early on plain media files without loading the whole file into RAM.
+	disguiseTailSearchWindow = 64 * 1024
 )
 
 // IsMediaFilename returns true if the extension is one Google Photos accepts
@@ -79,89 +91,178 @@ func init() {
 	mp4Template = b
 }
 
-// HideAsMP4 writes an MP4-disguised copy of src to dst. If dst is empty a
-// sibling `<src>.mp4` path is used. The returned path is the file to upload.
-func HideAsMP4(src, dst string) (string, error) {
-	info, err := os.Stat(src)
+// DisguiseSize returns the total byte size of the disguised container for a
+// payload of `srcSize` bytes. Used by upload to preflight `Content-Length`
+// without materializing the file on disk.
+func DisguiseSize(originalName string, srcSize int64) int64 {
+	return int64(len(mp4Template)) + int64(len(disguiseSeparator)) + 4 + int64(len(originalName)) + srcSize
+}
+
+// OpenDisguiseReader returns an io.ReadCloser that streams the disguised
+// representation of `src` without touching the disk. The reader owns the open
+// file handle to `src` and closes it when the caller calls Close(). `srcName`
+// is the filename to embed in the trailer (typically filepath.Base(src)).
+func OpenDisguiseReader(src, srcName string) (io.ReadCloser, int64, error) {
+	f, err := os.Open(src)
 	if err != nil {
-		return "", err
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("disguise: refusing to hide a directory (%s)", src)
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("disguise: refusing to hide a directory (%s)", src)
 	}
 
+	var trailer bytes.Buffer
+	trailer.WriteString(disguiseSeparator)
+	_ = binary.Write(&trailer, binary.LittleEndian, uint32(len(srcName)))
+	trailer.WriteString(srcName)
+
+	total := int64(len(mp4Template)) + int64(trailer.Len()) + info.Size()
+	r := io.MultiReader(
+		bytes.NewReader(mp4Template),
+		bytes.NewReader(trailer.Bytes()),
+		f,
+	)
+	return &disguiseReader{r: r, f: f}, total, nil
+}
+
+type disguiseReader struct {
+	r io.Reader
+	f *os.File
+}
+
+func (d *disguiseReader) Read(p []byte) (int, error) { return d.r.Read(p) }
+func (d *disguiseReader) Close() error               { return d.f.Close() }
+
+// HideAsMP4 writes an MP4-disguised copy of src to dst. If dst is empty a
+// sibling `<src>.mp4` path in os.TempDir is used, chosen to avoid clobbering
+// pre-existing files. The returned path is the file to upload. Callers should
+// os.Remove(returned path) when done.
+//
+// Prefer OpenDisguiseReader for large payloads to skip the disk round-trip.
+func HideAsMP4(src, dst string) (string, error) {
+	rc, _, err := OpenDisguiseReader(src, filepath.Base(src))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rc.Close() }()
+
+	var out *os.File
 	if dst == "" {
-		dst = src + disguiseSuffix
+		out, err = os.CreateTemp("", "gotohp-disguise-*"+disguiseSuffix)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		out, err = os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			return "", err
+		}
 	}
+	dstPath := out.Name()
 
-	out, err := os.Create(dst)
-	if err != nil {
+	if _, err := io.Copy(out, rc); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dstPath)
 		return "", err
 	}
-	defer func() { _ = out.Close() }()
-
-	// 1. MP4 cover (embedded template).
-	if _, err := out.Write(mp4Template); err != nil {
-		_ = os.Remove(dst)
-		return "", err
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dstPath)
+		return "", fmt.Errorf("disguise: close output: %w", err)
 	}
-
-	// 2. Separator + filename length + filename.
-	filename := filepath.Base(src)
-	if _, err := out.WriteString(disguiseSeparator); err != nil {
-		_ = os.Remove(dst)
-		return "", err
-	}
-	if err := binary.Write(out, binary.LittleEndian, uint32(len(filename))); err != nil {
-		_ = os.Remove(dst)
-		return "", err
-	}
-	if _, err := out.WriteString(filename); err != nil {
-		_ = os.Remove(dst)
-		return "", err
-	}
-
-	// 3. Payload.
-	in, err := os.Open(src)
-	if err != nil {
-		_ = os.Remove(dst)
-		return "", err
-	}
-	defer func() { _ = in.Close() }()
-	if _, err := io.Copy(out, in); err != nil {
-		_ = os.Remove(dst)
-		return "", err
-	}
-	return dst, nil
+	return dstPath, nil
 }
 
 // TryExtractDisguised inspects the file at path and, if it carries a
-// gp_disguise payload, writes the original bytes to outDir/<originalName>.
+// gp_disguise payload, streams the original bytes to outDir/<originalName>.
 // Returns (restoredPath, true, nil) on success, ("", false, nil) if the file
-// is a plain media file with no payload, and ("", false, err) on I/O errors
-// or corrupt payloads.
+// carries no payload, and ("", false, err) on I/O errors or corrupt payloads.
+//
+// The function seeks to the expected trailer position (right after the MP4
+// cover) so it does not load the whole file into memory even for multi-GB
+// payloads, and it will not misfire on plain media files whose bodies
+// happen to contain the separator elsewhere.
 func TryExtractDisguised(path, outDir string) (string, bool, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", false, err
 	}
-	sepIdx := bytes.LastIndex(data, []byte(disguiseSeparator))
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	minSize := int64(len(mp4Template)) + int64(len(disguiseSeparator)) + 4
+	if info.Size() < minSize {
+		return "", false, nil
+	}
+
+	// Read a window right after the template to look for the separator.
+	// Cover + trailer header should live in the first
+	//   len(mp4Template) + disguiseTailSearchWindow bytes.
+	headLen := int64(len(mp4Template)) + disguiseTailSearchWindow
+	if headLen > info.Size() {
+		headLen = info.Size()
+	}
+	head := make([]byte, headLen)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return "", false, err
+	}
+
+	sepBytes := []byte(disguiseSeparator)
+	// A disguised file always has the trailer at the very start of the
+	// bytes we appended, i.e. right after the template. Look for the
+	// FIRST occurrence at or after len(mp4Template); refuse to match a
+	// coincidental sequence earlier inside the cover.
+	searchFrom := 0
+	if len(mp4Template) < len(head) {
+		searchFrom = len(mp4Template) - len(sepBytes)
+		if searchFrom < 0 {
+			searchFrom = 0
+		}
+	}
+	sepIdx := bytes.Index(head[searchFrom:], sepBytes)
 	if sepIdx < 0 {
 		return "", false, nil
 	}
-	rest := data[sepIdx+len(disguiseSeparator):]
-	if len(rest) < 4 {
-		return "", false, errors.New("disguise: truncated after separator")
+	sepIdx += searchFrom
+
+	// Parse name-len + name from head; if head didn't cover the whole
+	// filename (very unusual: names > disguiseTailSearchWindow), refuse.
+	nameLenOffset := sepIdx + len(sepBytes)
+	if nameLenOffset+4 > len(head) {
+		return "", false, nil
 	}
-	nameLen := binary.LittleEndian.Uint32(rest[:4])
-	if nameLen == 0 || nameLen > 4096 {
-		return "", false, fmt.Errorf("disguise: implausible filename length %d", nameLen)
+	nameLen := binary.LittleEndian.Uint32(head[nameLenOffset : nameLenOffset+4])
+	if nameLen == 0 || nameLen > disguiseMaxNameLen {
+		return "", false, nil
 	}
-	if uint32(len(rest)) < 4+nameLen {
-		return "", false, errors.New("disguise: truncated in filename")
+	nameStart := nameLenOffset + 4
+	nameEnd := nameStart + int(nameLen)
+	if nameEnd > len(head) {
+		return "", false, nil
 	}
-	name := string(rest[4 : 4+nameLen])
-	payload := rest[4+nameLen:]
+	name := string(head[nameStart:nameEnd])
+	safeName, ok := sanitizeEmbeddedName(name)
+	if !ok {
+		return "", false, fmt.Errorf("disguise: unsafe embedded filename %q", name)
+	}
+
+	// Seek payload start and stream to disk.
+	payloadStart := int64(nameEnd)
+	payloadLen := info.Size() - payloadStart
+	if payloadLen < 0 {
+		return "", false, fmt.Errorf("disguise: negative payload length")
+	}
+	if _, err := f.Seek(payloadStart, io.SeekStart); err != nil {
+		return "", false, err
+	}
 
 	if outDir == "" {
 		outDir = filepath.Dir(path)
@@ -169,14 +270,70 @@ func TryExtractDisguised(path, outDir string) (string, bool, error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", false, err
 	}
-	// Guard against basename containing path separators from a malicious source.
-	safeName := filepath.Base(name)
-	if safeName == "." || safeName == string(filepath.Separator) {
-		return "", false, errors.New("disguise: invalid embedded filename")
+	outPath, out, err := createUniquely(outDir, safeName)
+	if err != nil {
+		return "", false, err
 	}
-	outPath := filepath.Join(outDir, safeName)
-	if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+	if _, err := io.CopyN(out, f, payloadLen); err != nil {
+		_ = out.Close()
+		_ = os.Remove(outPath)
+		return "", false, err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(outPath)
 		return "", false, err
 	}
 	return outPath, true, nil
+}
+
+// sanitizeEmbeddedName rejects filenames that could path-traverse or otherwise
+// escape outDir. Returns the safe basename and true, or "" and false if the
+// name is dangerous. This is stricter than filepath.Base alone — `..` slips
+// past Base, and Windows drive letters / backslashes need explicit rejection
+// even on Unix hosts because the trailer may have been produced elsewhere.
+func sanitizeEmbeddedName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return "", false
+	}
+	if strings.Contains(name, "..") {
+		return "", false
+	}
+	if strings.ContainsRune(name, ':') {
+		return "", false
+	}
+	if name == "." {
+		return "", false
+	}
+	// filepath.Base as a last-line-of-defense (harmless if already clean).
+	base := filepath.Base(name)
+	if base == "." || base == ".." || base == "" {
+		return "", false
+	}
+	return base, true
+}
+
+// createUniquely opens outDir/name with O_EXCL; on collision it appends
+// `-1`, `-2`, ... before the extension until it finds a free path, so a
+// disguised file never silently overwrites an unrelated user file.
+func createUniquely(outDir, name string) (string, *os.File, error) {
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 0; i < 10000; i++ {
+		candidate := name
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+		}
+		p := filepath.Join(outDir, candidate)
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			return p, f, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", nil, err
+		}
+	}
+	return "", nil, fmt.Errorf("disguise: could not find a unique name for %s", name)
 }
